@@ -1,6 +1,11 @@
 Changelog
 =========
 
+1.1.6 - 2025-10-27
+-------------------
+Added changes from DevPanda, all tests pass
+
+
 All notable changes to this project will be documented in this file.
 This project adheres to Semantic Versioning.
 
