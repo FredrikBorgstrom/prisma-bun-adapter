@@ -1,5 +1,7 @@
 import { createAdapter, type AdapterConfig } from "./lib/db-adapters";
 
+// Summary: Measure connection pooling efficiency and stability under increasing concurrent load using shared adapter helpers.
+
 class ConnectionEfficiencyTest {
   private async timeOperation<T>(operation: () => Promise<T>): Promise<{ result: T; duration: number }> {
     const start = performance.now();

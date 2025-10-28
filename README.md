@@ -232,6 +232,29 @@ Environment
 - Node.js is supported when using Prisma client in your app (the adapter still runs via Bun's native SQL inside the runtime). For most projects, you will run your Prisma client within Bun.
 - Suggested engines: Node >= 18, Bun >= 1.1
 
+
+Tests & Benchmarks
+------------------
+
+All tests and benchmarks are automactically configured in Docker, so you need to have Docker installed.
+
+1. Run `tests:setup` to spin up the test databases, initialize and seed them with data
+2. Run `tests:run` to run all tests and benchmarks
+3. Run `tests:stop` to stop and remove the database containers
+
+You can also run any of the individual tests/benchmarks to get more granular results:
+
+- `bun test:multi`
+- `bun test:comparison`
+- `test:comprehensive`
+- `test:performance`
+- `test:bench:prisma-complex`
+- `test:bench:sql-complex`
+- `demo:sqlite`
+- `demo:quick`
+
+Note: SQLite comparisons now use a `sql.js` (WebAssembly) baseline instead of `better-sqlite3`, because Bun currently crashes when loading that native module. The fallback keeps the demos runnable directly under Bun and includes a small simulated driver overhead so that results more closely match native Node.js adapters.
+
 Build & Publish (maintainers)
 -----------------------------
 
@@ -239,7 +262,7 @@ This package ships prebuilt JS and `.d.ts` types in `dist/`.
 
 Scripts:
 
-- `bun run build` – compile TypeScript to `dist/` with declarations
+- `bun prepublish` – (or `bun run build`), compile TypeScript to javascript with declarations and outputs to `dist/`
 - `bun run test:performance` – optional performance demo
 - `bun run test:comparison` – optional comparison scripts
  - `bun run test:bench:prisma-complex` – deep Prisma workloads (Bun vs PrismaPg)
@@ -247,9 +270,9 @@ Scripts:
 
 Publishing checklist:
 
-1. Update version in `package.json`.
-2. `bun run build`
-3. `npm publish` (or `npm publish --access public` for first publish)
+1. Update version number in `package.json`.
+2. Update CHANGELOG.md with new changes
+3. `bun publish`
 
 FAQ
 ---

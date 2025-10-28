@@ -1,10 +1,21 @@
 import { prisma } from "./lib/db";
 
+// Summary: Run an end-to-end Prisma adapter regression suite covering CRUD, relations, transactions, performance, and edge cases.
+
 interface TestResult {
   name: string;
   success: boolean;
   duration: number;
   error?: string;
+}
+
+interface ComprehensiveTestSummary {
+  summary: string;
+  total: number;
+  passed: number;
+  failed: number;
+  durationMs: number;
+  results: TestResult[];
 }
 
 class AdapterTester {
@@ -582,7 +593,8 @@ class AdapterTester {
     console.log(`\n${failedTests === 0 ? '🎉' : '⚠️'} Test Suite ${failedTests === 0 ? 'PASSED' : 'FAILED'}`);
   }
 
-  async runAllTests() {
+  async runAllTests(): Promise<ComprehensiveTestSummary> {
+    const suiteStart = performance.now();
     console.log("🧪 Comprehensive Prisma Bun PostgreSQL Adapter Test Suite");
     console.log("=" .repeat(60));
 
@@ -598,22 +610,52 @@ class AdapterTester {
 
     this.printSummary();
 
-    return this.results.every(r => r.success);
+    const totalTests = this.results.length;
+    const passedTests = this.results.filter(r => r.success).length;
+    const failedTests = totalTests - passedTests;
+    const totalDuration = this.results.reduce((sum, r) => sum + r.duration, 0);
+
+    const summaryText = [
+      `Total tests: ${totalTests}`,
+      `Passed: ${passedTests}`,
+      `Failed: ${failedTests}`,
+      `Total duration: ${totalDuration.toFixed(2)}ms`,
+      `Average duration: ${totalTests > 0 ? (totalDuration / totalTests).toFixed(2) : "0.00"}ms`,
+    ].join("\n");
+
+    return {
+      summary: summaryText,
+      total: totalTests,
+      passed: passedTests,
+      failed: failedTests,
+      durationMs: performance.now() - suiteStart,
+      results: [...this.results],
+    };
   }
 }
 
-async function main() {
+async function runComprehensiveTests(): Promise<ComprehensiveTestSummary> {
   const tester = new AdapterTester();
-  
+
   try {
-    const success = await tester.runAllTests();
-    process.exit(success ? 0 : 1);
-  } catch (error) {
-    console.error("❌ Test suite failed:", error);
-    process.exit(1);
+    return await tester.runAllTests();
   } finally {
     await prisma.$disconnect();
   }
 }
 
-main();
+async function main() {
+  try {
+    const summary = await runComprehensiveTests();
+    process.exit(summary.failed === 0 ? 0 : 1);
+  } catch (error) {
+    console.error("❌ Test suite failed:", error);
+    process.exit(1);
+  }
+}
+
+if (import.meta.main) {
+  main();
+}
+
+export { runComprehensiveTests };

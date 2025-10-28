@@ -1,6 +1,6 @@
 {
   "name": "@abcx3/prisma-bun-adapter",
-  "version": "1.1.6",
+  "version": "1.1.7",
   "description": "Prisma adapters for Bun's native SQL clients (PostgreSQL, MySQL, SQLite)",
   "type": "module",
   "main": "dist/index.js",
@@ -31,24 +31,18 @@
     "dev": "bun --watch src/index.ts",
     "test": "bun test",
     "debug:example": "bun --watch example/usage.ts",
-    "test:multi": "bun run test-app/multi-adapter-comparison.ts",
-    "test:comparison": "bun run test-app/bun-vs-prisma-comparison.ts",
-    "test:comprehensive": "bun test-app/setup-test-dbs.ts start && cd test-app && bun db:generate && bun db:migrate && bun db:seed && bun comprehensive-test.ts && cd ..",
-    "test:comprehensive:rerun": "bun test-app/comprehensive-test.ts",
+    "tests:setup": "bun test-app/setup-test-dbs.ts start && cd test-app && bun db:migrate dev && bun db:seed && cd ..",
+    "tests:run": "bun test-app/run-all-tests.ts",
+    "tests:stop": "bun test-app/setup-test-dbs.ts stop",
+    "test:multi": "bun test-app/multi-adapter-comparison.ts",
+    "test:comparison": "bun test-app/bun-vs-prisma-comparison.ts",
+    "test:comprehensive": "bun test-app/comprehensive-test.ts",
     "test:performance": "bun test-app/performance-comparison.ts",
-    "test:bench:prisma-complex": "bun test-app/complex-prisma-benchmarks.ts",
-    "test:bench:sql-complex": "bun test-app/complex-sql-benchmarks.ts",
+    "test:prisma:complex": "bun test-app/complex-prisma-benchmarks.ts",
+    "test:sql:complex": "bun test-app/complex-sql-benchmarks.ts",
     "demo:sqlite": "bun run test-app/sqlite-comparison-demo.ts",
     "demo:quick": "bun test-app/quick-comparison-demo.ts",
-    "db:start": "bun test-app/setup-test-dbs.ts start",
-    "db:stop": "bun test-app/setup-test-dbs.ts stop",
-    "db:restart": "bun db:stop && bun db:start",
-    "db:migrate": "bun test-app/setup-test-dbs.ts start && cd test-app && bun db:migrate && cd ..",
-    "db:generate": "bun test-app/setup-test-dbs.ts start && cd test-app && bun db:generate && cd ..",
-    "db:seed": "bun test-app/seed.ts",
-    "setup:dbs": "bun run test-app/setup-test-dbs.ts",
-    "setup:dbs:stop": "bun run test-app/setup-test-dbs.ts stop",
-    "prepublishOnly": "bun run build"
+    "publish": "bun run build && npm publish"
   },
   "keywords": [
     "prisma",
@@ -78,7 +72,8 @@
   "dependencies": {
     "@prisma/driver-adapter-utils": "^6.0.0",
     "@types/pg": "^8.15.5",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "sql.js": "^1.13.0"
   },
   "optionalDependencies": {
     "@prisma/adapter-pg": "^6.18.0",

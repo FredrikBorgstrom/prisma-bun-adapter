@@ -1,5 +1,7 @@
 import { prisma } from "./lib/db-simple";
 
+// Summary: Validate baseline Prisma connectivity without custom adapters before running adapter-specific tests.
+
 async function testBasicConnection() {
   console.log("🧪 Testing basic Prisma connection (without adapter)...\n");
 

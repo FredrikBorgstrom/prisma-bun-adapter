@@ -1,8 +1,18 @@
 import { BunSQLiteAdapter } from "../src/index.js";
+import { SqlJsTraditionalClient } from "./lib/sqljs-traditional-adapter.ts";
+
+const isJsonSummary = process.env.BUN_ADAPTER_SUMMARY_JSON === "1";
+const log = (...args: any[]) => {
+  if (!isJsonSummary) {
+    console.log(...args);
+  }
+};
+
+// Summary: Evaluate Bun's SQLite adapter against a sql.js-based traditional fallback for queries and CRUD workloads.
 
 /**
  * SQLite Performance Comparison Demo
- * Compares Bun's native SQLite with a simulated traditional approach
+ * Compares Bun's native SQLite with a sql.js (WASM) fallback traditional approach
  */
 
 interface BenchmarkResult {
@@ -13,48 +23,11 @@ interface BenchmarkResult {
   opsPerSecond: number;
 }
 
-// Simulate traditional SQLite operations (without actual better-sqlite3)
-class SimulatedTraditionalSQLite {
-  private data: Map<string, any[]> = new Map();
-  
-  constructor() {
-    // Initialize with some overhead to simulate traditional driver
-    this.data.set("test_table", []);
-  }
-  
-  async query(sql: string, params: any[] = []): Promise<any[]> {
-    // Simulate some overhead
-    await new Promise(resolve => setTimeout(resolve, 0.1));
-    
-    if (sql.includes("SELECT 1")) {
-      return [{ "1": 1 }];
-    }
-    
-    if (sql.includes("SELECT ? as iteration")) {
-      return [{ iteration: params[0] }];
-    }
-    
-    if (sql.includes("CREATE TABLE")) {
-      return [];
-    }
-    
-    if (sql.includes("INSERT")) {
-      const table = this.data.get("test_table") || [];
-      table.push({ id: table.length + 1, name: params[0] });
-      this.data.set("test_table", table);
-      return [];
-    }
-    
-    if (sql.includes("SELECT * FROM test_table")) {
-      return this.data.get("test_table") || [];
-    }
-    
-    return [];
-  }
-  
-  close() {
-    this.data.clear();
-  }
+interface SQLiteDemoSummary {
+  summary: string;
+  benchmarks: BenchmarkResult[];
+  speedup: number;
+  crudScenarios: number;
 }
 
 async function benchmarkBunSQLite(operations: number): Promise<BenchmarkResult> {
@@ -66,13 +39,10 @@ async function benchmarkBunSQLite(operations: number): Promise<BenchmarkResult> 
   
   const startTime = performance.now();
   
-  // Run benchmark operations
-  const promises = [];
+  // Run benchmark operations sequentially to mimic real driver roundtrips
   for (let i = 0; i < operations; i++) {
-    promises.push(driverAdapter.queryRaw({ sql: "SELECT ? as iteration", args: [i] }));
+    await driverAdapter.queryRaw({ sql: "SELECT ? as iteration", args: [i] });
   }
-  
-  await Promise.all(promises);
   
   const endTime = performance.now();
   const totalTime = endTime - startTime;
@@ -89,28 +59,25 @@ async function benchmarkBunSQLite(operations: number): Promise<BenchmarkResult> 
 }
 
 async function benchmarkTraditionalSQLite(operations: number): Promise<BenchmarkResult> {
-  const db = new SimulatedTraditionalSQLite();
+  const db = new SqlJsTraditionalClient(":memory:");
   
   // Warm up
   await db.query("SELECT 1");
   
   const startTime = performance.now();
   
-  // Run benchmark operations
-  const promises = [];
+  // Run benchmark operations sequentially to mimic real driver roundtrips
   for (let i = 0; i < operations; i++) {
-    promises.push(db.query("SELECT ? as iteration", [i]));
+    await db.query("SELECT ? as iteration", [i]);
   }
-  
-  await Promise.all(promises);
   
   const endTime = performance.now();
   const totalTime = endTime - startTime;
   
-  db.close();
+  await db.close();
   
   return {
-    name: "Traditional SQLite (Simulated)",
+    name: "Traditional SQLite (sql.js)",
     operations,
     totalTime,
     avgTime: totalTime / operations,
@@ -118,9 +85,9 @@ async function benchmarkTraditionalSQLite(operations: number): Promise<Benchmark
   };
 }
 
-async function runCRUDComparison(): Promise<void> {
-  console.log("📊 CRUD Operations Comparison:");
-  console.log("=============================");
+async function runCRUDComparison(): Promise<number> {
+  log("📊 CRUD Operations Comparison:");
+  log("=============================");
   
   // Test CRUD operations
   const crudTests = [
@@ -170,7 +137,7 @@ async function runCRUDComparison(): Promise<void> {
   
   for (const test of crudTests) {
     if (test.operations) {
-      console.log(`\n${test.name}:`);
+      log(`\n${test.name}:`);
       
       // Bun adapter
       const bunAdapter = new BunSQLiteAdapter(":memory:");
@@ -193,7 +160,7 @@ async function runCRUDComparison(): Promise<void> {
       await bunDriver.dispose();
       
       // Traditional adapter
-      const traditionalAdapter = new SimulatedTraditionalSQLite();
+      const traditionalAdapter = new SqlJsTraditionalClient(":memory:");
       await traditionalAdapter.query(`CREATE TABLE IF NOT EXISTS test_table (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
@@ -204,24 +171,26 @@ async function runCRUDComparison(): Promise<void> {
       await test.operations(traditionalAdapter, false);
       const traditionalTime = performance.now() - traditionalStart;
       
-      traditionalAdapter.close();
+      await traditionalAdapter.close();
       
       const speedup = traditionalTime / bunTime;
       
-      console.log(`  🚀 Bun: ${bunTime.toFixed(2)}ms`);
-      console.log(`  🔧 Traditional: ${traditionalTime.toFixed(2)}ms`);
-      console.log(`  📈 Speedup: ${speedup.toFixed(2)}x`);
+      log(`  🚀 Bun: ${bunTime.toFixed(2)}ms`);
+      log(`  🔧 Traditional: ${traditionalTime.toFixed(2)}ms`);
+      log(`  📈 Speedup: ${speedup.toFixed(2)}x`);
     }
   }
+
+  return crudTests.length;
 }
 
-async function main(): Promise<void> {
-  console.log("🗃️  SQLite Performance Comparison Demo\n");
-  console.log("This demo compares Bun's native SQLite adapter with traditional approaches.\n");
+async function main(): Promise<SQLiteDemoSummary> {
+  log("🗃️  SQLite Performance Comparison Demo\n");
+  log("This demo compares Bun's native SQLite adapter with traditional approaches.\n");
   
-  const operations = 1000;
+  const operations = 5000;
   
-  console.log(`📊 Running ${operations} query operations...\n`);
+  log(`📊 Running ${operations} query operations...\n`);
   
   // Run benchmarks
   const [bunResult, traditionalResult] = await Promise.all([
@@ -230,52 +199,80 @@ async function main(): Promise<void> {
   ]);
   
   // Display results
-  console.log("📈 Benchmark Results:");
-  console.log("====================");
+  log("📈 Benchmark Results:");
+  log("====================");
   
   [bunResult, traditionalResult].forEach(result => {
     const icon = result.name.includes("Bun") ? "🚀" : "🔧";
-    console.log(`${icon} ${result.name}:`);
-    console.log(`   Total time: ${result.totalTime.toFixed(2)}ms`);
-    console.log(`   Avg per op: ${result.avgTime.toFixed(3)}ms`);
-    console.log(`   Ops/second: ${result.opsPerSecond.toFixed(0)}`);
-    console.log();
+    log(`${icon} ${result.name}:`);
+    log(`   Total time: ${result.totalTime.toFixed(2)}ms`);
+    log(`   Avg per op: ${result.avgTime.toFixed(3)}ms`);
+    log(`   Ops/second: ${result.opsPerSecond.toFixed(0)}`);
+    log();
   });
   
   // Performance comparison
   const speedup = traditionalResult.opsPerSecond > 0 ? 
     bunResult.opsPerSecond / traditionalResult.opsPerSecond : 0;
   
-  console.log("⚡ Performance Comparison:");
-  console.log("=========================");
-  console.log(`🚀 Bun SQLite: ${bunResult.opsPerSecond.toFixed(0)} ops/sec`);
-  console.log(`🔧 Traditional: ${traditionalResult.opsPerSecond.toFixed(0)} ops/sec`);
+  log("⚡ Performance Comparison:");
+  log("=========================");
+  log(`🚀 Bun SQLite: ${bunResult.opsPerSecond.toFixed(0)} ops/sec`);
+  log(`🔧 Traditional: ${traditionalResult.opsPerSecond.toFixed(0)} ops/sec`);
   
   if (speedup > 1) {
-    console.log(`📈 Bun is ${speedup.toFixed(2)}x faster!`);
+    log(`📈 Bun is ${speedup.toFixed(2)}x faster!`);
   } else if (speedup > 0) {
-    console.log(`📉 Traditional is ${(1/speedup).toFixed(2)}x faster`);
+    log(`📉 Traditional is ${(1/speedup).toFixed(2)}x faster`);
   }
   
-  console.log();
+  log();
   
   // CRUD comparison
-  await runCRUDComparison();
+  const crudScenarioCount = await runCRUDComparison();
   
-  console.log("\n🎯 Key Advantages of Bun SQLite Adapter:");
-  console.log("========================================");
-  console.log("🚀 Native Bun runtime integration");
-  console.log("⚡ Optimized template string caching");
-  console.log("🔄 Efficient parameter placeholder conversion");
-  console.log("📦 No external dependencies");
-  console.log("🛡️  Type-safe with Prisma integration");
-  console.log("🔧 Consistent API across all database types");
+  log("\n🎯 Key Advantages of Bun SQLite Adapter:");
+  log("========================================");
+  log("🚀 Native Bun runtime integration");
+  log("⚡ Optimized template string caching");
+  log("🔄 Efficient parameter placeholder conversion");
+  log("📦 No external dependencies");
+  log("🛡️  Type-safe with Prisma integration");
+  log("🔧 Consistent API across all database types");
   
-  console.log("\n💡 Note: This demo uses simulated traditional SQLite operations.");
-  console.log("   Real-world performance differences may vary based on:");
-  console.log("   • Database size and complexity");
-  console.log("   • Query patterns and frequency");
-  console.log("   • System resources and configuration");
+  log("\n💡 Note: Traditional SQLite numbers use sql.js (WASM) as a safe fallback in Bun.");
+  log("   Real-world performance with native Node.js drivers like better-sqlite3 will differ.");
+  log("   Differences also depend on:");
+  log("   • Database size and complexity");
+  log("   • Query patterns and frequency");
+  log("   • System resources and configuration");
+
+  const summaryText = [
+    `Benchmark operations: ${operations}`,
+    `Bun SQLite: ${bunResult.opsPerSecond.toFixed(0)} ops/sec (${bunResult.avgTime.toFixed(3)}ms avg)`,
+    `Traditional SQLite: ${traditionalResult.opsPerSecond.toFixed(0)} ops/sec (${traditionalResult.avgTime.toFixed(3)}ms avg)`,
+    speedup > 0
+      ? `Relative speed: ${speedup >= 1 ? `${speedup.toFixed(2)}x faster` : `${(1 / speedup).toFixed(2)}x slower`}`
+      : "Relative speed: unavailable",
+    `CRUD scenarios evaluated: ${crudScenarioCount}`,
+  ].join("\n");
+
+  if (isJsonSummary) {
+    const payload = {
+      summary: summaryText,
+      benchmarks: [bunResult, traditionalResult],
+      speedup,
+      crudScenarios: crudScenarioCount,
+    };
+    console.log(JSON.stringify(payload));
+  }
+
+  return {
+    summary: summaryText,
+    benchmarks: [bunResult, traditionalResult],
+    speedup,
+    crudScenarios: crudScenarioCount,
+  };
 }
 
 if (import.meta.main) {

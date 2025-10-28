@@ -1,5 +1,7 @@
-import { BunPostgresAdapter, BunMySQLAdapter, BunSQLiteAdapter } from "../src/index.js";
+import { BunPostgresAdapter, BunMySQLAdapter, BunSQLiteAdapter, BunPostgresOptimized } from "../src/index.js";
 import { databases as testDatabases } from "./setup-test-dbs.ts";
+
+// Summary: Compare Bun adapters across PostgreSQL, MySQL, and SQLite with CRUD, transactions, and availability checks.
 
 const POSTGRES_URL = testDatabases.find((d) => d.name === "PostgreSQL")!.connectionString;
 const MYSQL_URL = testDatabases.find((d) => d.name === "MySQL")!.connectionString;
@@ -31,6 +33,19 @@ interface AdapterConfig {
   };
 }
 
+interface AdapterRunSummary {
+  summary: string;
+  availability: Array<{ adapter: string; available: boolean }>;
+  adapters: Array<{
+    adapter: string;
+    successRate: string;
+    avgDuration: string;
+    status: string;
+    available: boolean;
+  }>;
+  results: TestResult[];
+}
+
 // Connection availability cache
 const connectionCache = new Map<string, { available: boolean; error?: string }>();
 
@@ -38,6 +53,25 @@ const adapters: AdapterConfig[] = [
   {
     name: "PostgreSQL",
     adapter: BunPostgresAdapter,
+    connectionString: POSTGRES_URL,
+    testQueries: {
+      simple: "SELECT 1 as test_value",
+      parameterized: { sql: "SELECT $1 as param_value", args: ["test_param"] },
+      create: `CREATE TABLE IF NOT EXISTS test_table (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+      insert: { sql: "INSERT INTO test_table (name) VALUES ($1) RETURNING id", args: ["test_name"] },
+      select: "SELECT * FROM test_table ORDER BY id",
+      update: { sql: "UPDATE test_table SET name = $1 WHERE id = $2", args: ["updated_name", 1] },
+      delete: "DELETE FROM test_table WHERE id = 1",
+      drop: "DROP TABLE IF EXISTS test_table",
+    },
+  },
+  {
+    name: "PostgreSQL (Optimized)",
+    adapter: BunPostgresOptimized,
     connectionString: POSTGRES_URL,
     testQueries: {
       simple: "SELECT 1 as test_value",
@@ -176,7 +210,7 @@ async function runTest(
   }
 }
 
-async function runAllTests(): Promise<void> {
+async function runAllTests(): Promise<AdapterRunSummary> {
   console.log("🚀 Starting Multi-Adapter Comparison Tests\n");
   
   // First, check which databases are available
@@ -405,6 +439,38 @@ async function runAllTests(): Promise<void> {
       });
     }
   }
+
+  const executedResults = allResults.filter((r) => !r.skipped);
+  const passedResults = executedResults.filter((r) => r.success);
+  const failedResults = executedResults.length - passedResults.length;
+  const skippedResults = allResults.length - executedResults.length;
+
+  const unavailableAdapters = availabilityResults
+    .filter((r) => !r.available)
+    .map((r) => r.adapter);
+
+  const summaryLines = summary.map(
+    (s) => `${s.adapter}: ${s.successRate} tests passed, avg ${s.avgDuration}`
+  );
+
+  const summaryText = [
+    `Adapters available: ${availableCount}/${totalCount}`,
+    `Results: ${passedResults.length} passed, ${failedResults} failed, ${skippedResults} skipped`,
+    unavailableAdapters.length > 0
+      ? `Unavailable adapters: ${unavailableAdapters.join(", ")}`
+      : "All adapters available",
+    availableAdapters.length > 1
+      ? "Performance comparison executed"
+      : "Performance comparison skipped (need at least 2 available adapters)",
+    ...summaryLines.map((line) => `• ${line}`),
+  ].join("\n");
+
+  return {
+    summary: summaryText,
+    availability: availabilityResults,
+    adapters: summary,
+    results: allResults,
+  };
 }
 
 // Run the tests

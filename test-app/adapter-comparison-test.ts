@@ -1,5 +1,7 @@
 import { createAdapter, type AdapterConfig, type AdapterType } from "./lib/db-adapters";
 
+// Summary: Compare adapter implementations by running shared Prisma test suites and aggregating success rates.
+
 interface TestResult {
   name: string;
   success: boolean;

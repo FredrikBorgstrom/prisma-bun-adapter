@@ -1,5 +1,7 @@
 import { createAdapter, type AdapterConfig } from "./lib/db-adapters";
 
+// Summary: Profile specific query shapes to understand per-adapter latency distribution and warm-up behavior.
+
 class DetailedProfiler {
   private async profileQuery(adapter: AdapterConfig, queryName: string, queryFn: () => Promise<any>) {
     const { prisma } = adapter;

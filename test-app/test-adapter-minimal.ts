@@ -1,6 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 import { BunPostgresAdapter } from "prisma-bun-postgres-adapter";
 
+// Summary: Smoke test the Bun PostgreSQL adapter with minimal setup to ensure basic connectivity and queries succeed.
+
 async function testAdapter() {
   console.log("🧪 Testing Bun PostgreSQL Adapter (minimal)...\n");
 

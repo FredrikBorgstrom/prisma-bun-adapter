@@ -3,6 +3,13 @@ Changelog
 
 1.1.6 - 2025-10-27
 -------------------
+Several updates to tests.
+Added run-all-tests.ts that... you guessed it, runs all tests.
+Add sql.js dependency for SQLite fallback, update package version, and enhance test scripts for improved database setup and execution. 
+
+
+1.1.6 - 2025-10-27
+-------------------
 Added changes from DevPanda, all tests pass
 
 

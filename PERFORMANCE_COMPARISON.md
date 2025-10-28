@@ -26,7 +26,7 @@ Compares Bun adapters with official Prisma adapters:
 **Bun Adapters:**
 - `BunPostgresAdapter` vs `@prisma/adapter-pg`
 - `BunMySQLAdapter` vs `@prisma/adapter-planetscale`
-- `BunSQLiteAdapter` vs `better-sqlite3` (when available)
+- `BunSQLiteAdapter` vs a `sql.js` (WASM) fallback for traditional SQLite drivers
 
 **What it tests:**
 - Connection overhead
@@ -40,7 +40,7 @@ Head-to-head performance comparison with traditional Node.js drivers:
 **Comparisons:**
 - Bun PostgreSQL vs `pg` driver
 - Bun MySQL vs `mysql2` driver
-- Bun SQLite vs `better-sqlite3` driver
+- Bun SQLite vs `sql.js` (WASM) baseline
 
 **Metrics:**
 - Operations per second
@@ -51,7 +51,7 @@ Head-to-head performance comparison with traditional Node.js drivers:
 ### 4. SQLite Demo (`bun run demo:sqlite`)
 Interactive demonstration of SQLite performance differences:
 
-- 🚀 **Bun native SQLite** vs simulated traditional approach
+- 🚀 **Bun native SQLite** vs `sql.js` (WASM) fallback baseline
 - **CRUD operation benchmarks**
 - **Real-time performance metrics**
 - **Feature comparison**
@@ -104,9 +104,10 @@ if (cached) {
 #### SQLite
 ```
 🚀 Bun SQLite: ~50,000-100,000 ops/sec
-🔧 Traditional (better-sqlite3): ~30,000-80,000 ops/sec
-📈 Improvement: 1.2-2.0x faster
+🔧 Traditional (sql.js WASM baseline): in-process WASM fallback used for compatibility
 ```
+
+📎 Note: sql.js runs entirely in-process and is not representative of native Node.js drivers like better-sqlite3.
 
 *Note: Results vary based on query complexity, system resources, and database configuration.*
 

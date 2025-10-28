@@ -2,6 +2,8 @@ import { PrismaClient } from "@prisma/client";
 import { createAdapter, type AdapterConfig } from "./lib/db-adapters";
 import { databases as testDatabases } from "./setup-test-dbs.ts";
 
+// Summary: Stress-test complex Prisma ORM workloads comparing Bun adapter performance to Prisma's PostgreSQL driver.
+
 const POSTGRES_URL = testDatabases.find((d) => d.name === "PostgreSQL")!.connectionString;
 
 type CaseResult = {
@@ -11,6 +13,24 @@ type CaseResult = {
   winner: "bun" | "prisma" | "tie";
   improvementPct: number; // positive favors winner
 };
+
+interface ComplexPrismaBenchmarkSummary {
+  summary: string;
+  totalCases: number;
+  bunWins: number;
+  prismaWins: number;
+  ties: number;
+  averageBunMs: number;
+  averagePrismaMs: number;
+  overallWinner: "bun" | "prisma" | "tie";
+  overallImprovementPct: number;
+  highlights: {
+    bun: string[];
+    neutral: string[];
+    prisma: string[];
+  };
+  results: CaseResult[];
+}
 
 function fmt(ms: number) {
   return `${ms.toFixed(2)}ms`;
@@ -94,7 +114,7 @@ async function ensureDataset(prisma: PrismaClient, opts?: { users?: number; post
   }
 }
 
-async function run(): Promise<void> {
+async function runComplexPrismaBenchmarks(): Promise<ComplexPrismaBenchmarkSummary> {
   // Use centrally defined test database connection
   process.env.DATABASE_URL = POSTGRES_URL;
 
@@ -280,8 +300,34 @@ async function run(): Promise<void> {
     console.log("- Window functions and CTEs run through $queryRaw, showing driver overhead more directly.");
     console.log("- Large IN lists stress parameter handling and template caching.");
     console.log("- Concurrency demo highlights connection and prepared statement reuse.");
-  } catch (err: any) {
-    console.error("❌ Complex benchmark failed:", err?.message ?? err);
+    
+    const summaryText = [
+      `Cases: ${results.length}`,
+      `Bun wins: ${bunWins.length}`,
+      `Prisma wins: ${prismaWins.length}`,
+      `Ties: ${ties.length}`,
+      `Average Bun: ${fmt(avgBun)}`,
+      `Average Prisma: ${fmt(avgPrisma)}`,
+      `Overall winner: ${overall} (${overallPct.toFixed(1)}% diff)`,
+    ].join("\n");
+
+    return {
+      summary: summaryText,
+      totalCases: results.length,
+      bunWins: bunWins.length,
+      prismaWins: prismaWins.length,
+      ties: ties.length,
+      averageBunMs: avgBun,
+      averagePrismaMs: avgPrisma,
+      overallWinner: overall,
+      overallImprovementPct: overallPct,
+      highlights: {
+        bun: shine.length ? shine : ["No >10% wins in this run"],
+        neutral: neutral.length ? neutral : ["None"],
+        prisma: regress.length ? regress : ["No >10% regressions in this run"],
+      },
+      results,
+    };
   } finally {
     if (bun) await bun.dispose();
     if (pg) await pg.dispose();
@@ -289,5 +335,14 @@ async function run(): Promise<void> {
 }
 
 if (import.meta.main) {
-  run();
+  runComplexPrismaBenchmarks()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error("❌ Complex benchmark failed:", err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    });
 }
+
+export { runComplexPrismaBenchmarks };

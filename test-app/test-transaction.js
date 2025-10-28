@@ -1,5 +1,7 @@
 import { BunPostgresAdapter } from "../src/index.js";
 
+// Summary: Validate transactional support for the Bun PostgreSQL adapter including commit and rollback paths.
+
 async function testTransaction() {
   console.log("Testing native Bun transaction...");
   

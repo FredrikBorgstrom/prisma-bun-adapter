@@ -187,7 +187,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (command === "stop" || command === "clean") {
+  if (command === "stop") {
     console.log("🧹 Stopping test databases...\n");
     
     for (const db of databases) {
@@ -198,7 +198,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command === "start" || command === "setup") {
+  if (command === "start") {
     console.log("🚀 Setting up test databases...\n");
     
     const results: Array<{ db: DatabaseConfig; success: boolean }> = [];
@@ -248,8 +248,8 @@ async function main(): Promise<void> {
   console.log("  bun run test-app/setup-test-dbs.ts [command]");
   console.log("");
   console.log("Commands:");
-  console.log("  start, setup  Start test databases (default)");
-  console.log("  stop, clean   Stop and remove test databases");
+  console.log("  start        Start test databases (default)");
+  console.log("  stop         Stop and remove test databases");
 }
 
 if (import.meta.main) {

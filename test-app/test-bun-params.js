@@ -1,5 +1,7 @@
 const sql = new Bun.sql(process.env.DATABASE_URL);
 
+// Summary: Verify Bun's SQL tagged templates handle parameter binding and return expected metadata.
+
 // Test parameterized query
 const email = 'alice@example.com';
 const query = sql`SELECT * FROM users WHERE email = ${email}`;

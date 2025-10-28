@@ -2,6 +2,8 @@
 
 import { prisma } from "./lib/db";
 
+// Summary: Confirm full adapter setup by checking connectivity, queries, and transaction capabilities.
+
 async function validateSetup() {
   console.log("🔍 Validating Prisma Bun PostgreSQL Adapter setup...\n");
 

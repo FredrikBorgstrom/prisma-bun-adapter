@@ -1,5 +1,7 @@
 import { createAdapter, type AdapterConfig } from "./lib/db-adapters";
 
+// Summary: Measure cold versus warm query latency for Bun and Prisma adapters to highlight startup overhead.
+
 async function analyzeFirstQuery() {
   console.log("🔍 FIRST QUERY ANALYSIS");
   console.log("=".repeat(60));

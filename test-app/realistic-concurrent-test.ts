@@ -1,5 +1,7 @@
 import { createAdapter, type AdapterConfig } from "./lib/db-adapters";
 
+// Summary: Simulate realistic concurrent Prisma workloads to compare Bun adapter throughput against pg-based implementations.
+
 interface TestResult {
   testName: string;
   bunTime: number;

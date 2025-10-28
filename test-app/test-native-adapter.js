@@ -1,5 +1,7 @@
 import { BunPostgresAdapter } from "../src/index.js";
 
+// Summary: Exercise the low-level Bun adapter directly to confirm connection, querying, and cleanup.
+
 async function testAdapter() {
   console.log("Testing native Bun adapter...");
   

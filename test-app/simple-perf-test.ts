@@ -1,5 +1,7 @@
 import { createAdapter, type AdapterConfig } from "./lib/db-adapters";
 
+// Summary: Provide a quick side-by-side latency check between Bun and Prisma adapters for common Prisma queries.
+
 async function simplePerformanceTest() {
   console.log("🚀 SIMPLE PERFORMANCE COMPARISON");
   console.log("=".repeat(60));

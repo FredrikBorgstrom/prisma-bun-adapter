@@ -18,7 +18,7 @@
     "perf:connections": "bun connection-efficiency-test.ts",
     "db:up": "docker-compose up -d",
     "db:down": "docker-compose down",
-    "db:migrate": "bunx prisma migrate dev",
+    "db:migrate": "bunx prisma migrate dev --name init",
     "db:generate": "bunx prisma generate",
     "db:reset": "bunx prisma migrate reset --force",
     "db:seed": "bun seed.ts"

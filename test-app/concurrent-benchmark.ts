@@ -1,5 +1,7 @@
 import { createAdapter, type AdapterConfig } from "./lib/db-adapters";
 
+// Summary: Benchmark concurrent query throughput comparing Bun adapter to Prisma/pg under simultaneous workloads.
+
 interface ConcurrentTestResult {
   testName: string;
   bunTime: number;

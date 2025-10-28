@@ -1,6 +1,8 @@
 import { BunPostgresAdapter } from "../src/index.js";
 import { databases as testDatabases } from "./setup-test-dbs.ts";
 
+// Summary: Benchmark raw SQL workloads comparing Bun's adapter to pg across heavy aggregations, JSON, and concurrency.
+
 const POSTGRES_URL = testDatabases.find((d) => d.name === "PostgreSQL")!.connectionString;
 
 type Runner = {
@@ -23,6 +25,23 @@ type CaseResult = {
   winner: "bun" | "pg" | "tie";
   improvementPct: number;
 };
+
+interface ComplexSqlBenchmarkSummary {
+  summary: string;
+  totalCases: number;
+  bunWins: number;
+  pgWins: number;
+  ties: number;
+  averageBunMs: number;
+  averagePgMs: number;
+  overallWinner: "bun" | "pg" | "tie";
+  overallImprovementPct: number;
+  highlights: {
+    bun: string[];
+    pg: string[];
+  };
+  results: CaseResult[];
+}
 
 function fmt(ms: number) {
   return `${ms.toFixed(2)}ms`;
@@ -73,32 +92,36 @@ async function createPgClient(conn: string): Promise<SqlClient> {
 
 async function seedDataset(client: SqlClient): Promise<void> {
   // Create isolated benchmark tables to avoid interfering with Prisma tables
-  await client.execute(`
-    CREATE TABLE IF NOT EXISTS bench_users (
+  const schemaStatements = [
+    `CREATE TABLE IF NOT EXISTS bench_users (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS bench_posts (
+    )`,
+    `CREATE TABLE IF NOT EXISTS bench_posts (
       id SERIAL PRIMARY KEY,
       author_id INT NOT NULL REFERENCES bench_users(id),
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       published BOOLEAN NOT NULL DEFAULT TRUE,
       content TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS bench_tags (
+    )`,
+    `CREATE TABLE IF NOT EXISTS bench_tags (
       id SERIAL PRIMARY KEY,
       name TEXT UNIQUE NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS bench_post_tag (
+    )`,
+    `CREATE TABLE IF NOT EXISTS bench_post_tag (
       post_id INT NOT NULL REFERENCES bench_posts(id) ON DELETE CASCADE,
       tag_id INT NOT NULL REFERENCES bench_tags(id) ON DELETE CASCADE
-    );
-    CREATE TABLE IF NOT EXISTS bench_events (
+    )`,
+    `CREATE TABLE IF NOT EXISTS bench_events (
       id SERIAL PRIMARY KEY,
       payload JSONB NOT NULL,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-  `);
+    )`,
+  ];
+
+  for (const stmt of schemaStatements) {
+    await client.execute(stmt);
+  }
 
   // Quick counts
   const users = (await client.query(`SELECT COUNT(*)::int AS c FROM bench_users`))[0]?.c ?? 0;
@@ -121,17 +144,17 @@ async function seedDataset(client: SqlClient): Promise<void> {
   if (posts < 4000) {
     await client.execute(`
       INSERT INTO bench_posts(author_id, created_at, published, content)
-      SELECT floor(random()*200)+1,
-             NOW() - (floor(random()*365)||' days')::interval,
+      SELECT (floor(random()*200)::int + 1),
+             NOW() - make_interval(days => floor(random()*365)::int),
              (random() < 0.75),
-             repeat('x', 100 + floor(random()*1500))
+             repeat('x', (100 + floor(random()*1500)::int))
       FROM generate_series(${posts + 1}, 4000);
     `);
 
     // Attach tags randomly
     await client.execute(`
       INSERT INTO bench_post_tag(post_id, tag_id)
-      SELECT p.id, floor(random()*50)+1
+      SELECT p.id, (floor(random()*50)::int + 1)
       FROM bench_posts p
       WHERE p.id > ${posts}
       AND (random() < 0.6);
@@ -144,9 +167,9 @@ async function seedDataset(client: SqlClient): Promise<void> {
     await client.execute(`
       INSERT INTO bench_events(payload)
       SELECT jsonb_build_object(
-        'user', 'user_' || floor(random()*200)+1,
-        'type', (ARRAY['click','view','purchase'])[floor(random()*3)+1],
-        'value', floor(random()*1000),
+        'user', 'user_' || (floor(random()*200)::int + 1),
+        'type', (ARRAY['click','view','purchase'])[(floor(random()*3)::int + 1)],
+        'value', floor(random()*1000)::int,
         'tags', (SELECT jsonb_agg(name) FROM (
                   SELECT name FROM bench_tags ORDER BY random() LIMIT 3
                 ) t)
@@ -156,7 +179,7 @@ async function seedDataset(client: SqlClient): Promise<void> {
   }
 }
 
-async function main(): Promise<void> {
+async function runComplexSqlBenchmarks(): Promise<ComplexSqlBenchmarkSummary> {
   const conn = POSTGRES_URL;
 
   console.log("🚀 Complex SQL Benchmarks (Bun vs pg)");
@@ -308,8 +331,33 @@ async function main(): Promise<void> {
     console.log("- Tests emphasize SQL-side complexity (CTEs, windows, JSONB) to minimize ORM overhead.");
     console.log("- Large parameter lists probe placeholder translation and template caching.");
     console.log("- Concurrency case highlights scheduling and connection reuse behavior.");
-  } catch (err: any) {
-    console.error("❌ Failed:", err?.message ?? err);
+    
+    const summaryText = [
+      `Cases: ${results.length}`,
+      `Bun wins: ${bunWins.length}`,
+      `pg wins: ${pgWins.length}`,
+      `Ties: ${ties.length}`,
+      `Average Bun: ${fmt(avgBun)}`,
+      `Average pg: ${fmt(avgPg)}`,
+      `Overall winner: ${overall} (${overallPct.toFixed(1)}% diff)`,
+    ].join("\n");
+
+    return {
+      summary: summaryText,
+      totalCases: results.length,
+      bunWins: bunWins.length,
+      pgWins: pgWins.length,
+      ties: ties.length,
+      averageBunMs: avgBun,
+      averagePgMs: avgPg,
+      overallWinner: overall,
+      overallImprovementPct: overallPct,
+      highlights: {
+        bun: shine.length ? shine : ["No >10% wins in this run"],
+        pg: regress.length ? regress : ["No >10% regressions in this run"],
+      },
+      results,
+    };
   } finally {
     if (bun) await bun.close();
     if (pg) await pg.close();
@@ -317,5 +365,14 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main();
+  runComplexSqlBenchmarks()
+    .then(() => {
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error("❌ Failed:", err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    });
 }
+
+export { runComplexSqlBenchmarks };

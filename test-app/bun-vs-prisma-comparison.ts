@@ -1,6 +1,9 @@
-import { BunPostgresAdapter, BunMySQLAdapter, BunSQLiteAdapter } from "../src/index.js";
 import { PrismaClient as PrismaClientPg } from "@prisma/client";
-import { databases as testDatabases } from "./setup-test-dbs.ts";
+import { BunMySQLAdapter, BunPostgresAdapter, BunSQLiteAdapter, BunPostgresOptimized } from "../src/index.js";
+import { createSqlJsDriverAdapter } from "./lib/sqljs-traditional-adapter.ts";
+import { databases as testDatabases } from "./setup-test-dbs";
+
+// Summary: Compare Bun ORM adapters against Prisma equivalents across databases to measure functionality and relative speed.
 
 const POSTGRES_URL = testDatabases.find((d) => d.name === "PostgreSQL")!.connectionString;
 const MYSQL_URL = testDatabases.find((d) => d.name === "MySQL")!.connectionString;
@@ -35,6 +38,14 @@ interface AdapterConfig {
     delete: string;
     drop: string;
   };
+}
+
+interface AdapterComparisonSummary {
+  summary: string;
+  availability: Array<{ adapter: string; type: "bun" | "prisma"; available: boolean }>;
+  results: TestResult[];
+  overallWinner?: "bun" | "prisma" | "tie";
+  differencePct?: number;
 }
 
 // Connection availability cache
@@ -73,15 +84,6 @@ async function loadPrismaAdapters() {
     console.log("⚠️  Prisma MySQL client not found. Generate with: bunx prisma generate --schema test-app/prisma/mysql.schema.prisma");
   }
 
-  try {
-    // Try to import better-sqlite3 - it might not be available in Bun
-    const Database = await import("better-sqlite3");
-    adapters.Database = Database.default || Database;
-  } catch (error) {
-    // SQLite comparison will be skipped
-    console.log("⚠️  better-sqlite3 not available for Prisma SQLite comparison");
-  }
-
   return adapters;
 }
 
@@ -94,6 +96,26 @@ async function createAdapterConfigs(): Promise<AdapterConfig[]> {
       name: "Bun PostgreSQL",
       type: "bun",
       adapter: BunPostgresAdapter,
+      connectionString: POSTGRES_URL,
+      testQueries: {
+        simple: "SELECT 1 as test_value",
+        parameterized: { sql: "SELECT $1 as param_value", args: ["test_param"] },
+        create: `CREATE TABLE IF NOT EXISTS test_table (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(100),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`,
+        insert: { sql: "INSERT INTO test_table (name) VALUES ($1) RETURNING id", args: ["test_name"] },
+        select: "SELECT * FROM test_table ORDER BY id",
+        update: { sql: "UPDATE test_table SET name = $1 WHERE id = $2", args: ["updated_name", 1] },
+        delete: "DELETE FROM test_table WHERE id = 1",
+        drop: "DROP TABLE IF EXISTS test_table",
+      },
+    },
+    {
+      name: "Bun PostgreSQL (Optimized)",
+      type: "bun",
+      adapter: BunPostgresOptimized,
       connectionString: POSTGRES_URL,
       testQueries: {
         simple: "SELECT 1 as test_value",
@@ -151,6 +173,35 @@ async function createAdapterConfigs(): Promise<AdapterConfig[]> {
       },
     },
   ];
+
+  configs.push({
+    name: "Traditional SQLite (sql.js)",
+    type: "prisma",
+    adapter: class SqlJsAdapter {
+      connectionString: string;
+      constructor(connectionString: string = ":memory:") {
+        this.connectionString = connectionString || ":memory:";
+      }
+      async connect() {
+        return createSqlJsDriverAdapter(this.connectionString);
+      }
+    },
+    connectionString: ":memory:",
+    testQueries: {
+      simple: "SELECT 1 as test_value",
+      parameterized: { sql: "SELECT ? as param_value", args: ["test_param"] },
+      create: `CREATE TABLE IF NOT EXISTS test_table (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
+      insert: { sql: "INSERT INTO test_table (name) VALUES (?)", args: ["test_name"] },
+      select: "SELECT * FROM test_table ORDER BY id",
+      update: { sql: "UPDATE test_table SET name = ? WHERE id = ?", args: ["updated_name", 1] },
+      delete: "DELETE FROM test_table WHERE id = 1",
+      drop: "DROP TABLE IF EXISTS test_table",
+    },
+  });
 
   // Add Prisma adapters if available
   if (prismaAdapters.PrismaPg && prismaAdapters.Pool) {
@@ -265,13 +316,74 @@ async function createAdapterConfigs(): Promise<AdapterConfig[]> {
         select: "SELECT * FROM test_table ORDER BY id",
         update: { sql: "UPDATE test_table SET name = ? WHERE id = ?", args: ["updated_name", 1] },
         delete: "DELETE FROM test_table WHERE id = 1",
-        drop: "DROP TABLE IF EXISTS test_table",
+      drop: "DROP TABLE IF EXISTS test_table",
       },
     });
   }
 
-  // Note: Prisma SQLite adapter (better-sqlite3) may not work well with Bun
-  // We'll skip it for now as Bun has its own SQLite implementation
+  try {
+    const mysqlModule = await import("mysql2/promise");
+    configs.push({
+      name: "Traditional MySQL (mysql2)",
+      type: "prisma",
+      adapter: class Mysql2Adapter {
+        constructor(private readonly connectionString: string) {}
+        async connect() {
+          const pool = mysqlModule.default.createPool({
+            uri: this.connectionString,
+            connectionLimit: 10,
+          });
+          return {
+            queryRaw: async ({ sql, args = [] }: { sql: string; args?: any[] }) => {
+              const [rows] = await pool.query(sql, args);
+              if (!Array.isArray(rows) || rows.length === 0) {
+                return { rows: [], columnNames: [], columnTypes: [] };
+              }
+              const columnNames = Object.keys(rows[0] as Record<string, unknown>);
+              const values = (rows as Record<string, unknown>[]).map((row) =>
+                columnNames.map((name) => row[name]),
+              );
+              return {
+                rows: values,
+                columnNames,
+                columnTypes: columnNames.map(() => "unknown"),
+              };
+            },
+            executeRaw: async ({ sql, args = [] }: { sql: string; args?: any[] }) => {
+              const [result] = await pool.execute(sql, args);
+              return result;
+            },
+            close: async () => {
+              await pool.end();
+            },
+          };
+        }
+      },
+      connectionString: MYSQL_URL,
+      testQueries: {
+        simple: "SELECT 1 as test_value",
+        parameterized: { sql: "SELECT ? as param_value", args: ["test_param"] },
+        create: `CREATE TABLE IF NOT EXISTS test_table (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          name VARCHAR(100),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`,
+        insert: { sql: "INSERT INTO test_table (name) VALUES (?)", args: ["test_name"] },
+        select: "SELECT * FROM test_table ORDER BY id",
+        update: { sql: "UPDATE test_table SET name = ? WHERE id = ?", args: ["updated_name", 1] },
+        delete: "DELETE FROM test_table WHERE id = 1",
+        drop: "DROP TABLE IF EXISTS test_table",
+      },
+    });
+  } catch (error) {
+    console.log(
+      "⚠️  mysql2 not available for traditional MySQL comparison:",
+      (error as Error).message,
+    );
+  }
+
+  // Note: Traditional SQLite comparisons use sql.js (WASM) to avoid Bun-native crashes
+  // This keeps a non-Bun baseline while staying fully compatible with Bun's runtime.
 
   return configs;
 }
@@ -311,7 +423,7 @@ async function checkConnection(adapterConfig: AdapterConfig): Promise<{ availabl
 async function runTest(
   adapterConfig: AdapterConfig,
   testName: string,
-  testFn: (driverAdapter: any) => Promise<any>
+  testFn: (driverAdapter: any, config: AdapterConfig) => Promise<any>
 ): Promise<TestResult> {
   const startTime = performance.now();
   
@@ -377,7 +489,7 @@ async function runTest(
   }
 }
 
-async function runAllTests(): Promise<void> {
+async function runAllTests(): Promise<AdapterComparisonSummary> {
   console.log("🚀 Bun vs Prisma Adapter Comparison\n");
   
   const adapters = await createAdapterConfigs();
@@ -412,7 +524,9 @@ async function runAllTests(): Promise<void> {
   const totalCount = availabilityResults.length;
   
   console.log(`\n📊 Status: ${availableCount}/${totalCount} adapters available for testing`);
-  
+
+  const allResults: TestResult[] = [];
+
   if (availableCount === 0) {
     console.log("\n❌ No adapters available for comparison testing.");
     console.log("\n💡 To enable database testing:");
@@ -421,7 +535,18 @@ async function runAllTests(): Promise<void> {
     console.log("      export TEST_POSTGRES_URL='postgresql://user:pass@localhost:5433/db'");
     console.log("      export TEST_MYSQL_URL='mysql://user:pass@localhost:3306/db'");
     console.log("\n🗃️  For SQLite-only testing, try: bun run demo:sqlite");
-    return;
+    
+    const summaryText = [
+      `Adapters available: ${availableCount}/${totalCount}`,
+      "Tests skipped: No adapters could connect.",
+      "Setup databases with environment variables or bun run setup:dbs."
+    ].join("\n");
+
+    return {
+      summary: summaryText,
+      availability: availabilityResults,
+      results: allResults,
+    };
   }
   
   console.log();
@@ -430,13 +555,27 @@ async function runAllTests(): Promise<void> {
     {
       name: "Simple Query Test",
       test: async (driverAdapter: any, config: AdapterConfig) => {
-        return await driverAdapter.queryRaw({ sql: config.testQueries.simple, args: [] });
+        const iterations = 2000;
+        let lastResult: any = null;
+
+        for (let i = 0; i < iterations; i++) {
+          lastResult = await driverAdapter.queryRaw({ sql: config.testQueries.simple, args: [] });
+        }
+
+        return lastResult;
       },
     },
     {
       name: "Parameterized Query Test", 
       test: async (driverAdapter: any, config: AdapterConfig) => {
-        return await driverAdapter.queryRaw(config.testQueries.parameterized);
+        const iterations = 2000;
+        let lastResult: any = null;
+
+        for (let i = 0; i < iterations; i++) {
+          lastResult = await driverAdapter.queryRaw(config.testQueries.parameterized);
+        }
+
+        return lastResult;
       },
     },
     {
@@ -445,19 +584,62 @@ async function runAllTests(): Promise<void> {
         // Test multiple quick operations to measure connection overhead
         const startTime = performance.now();
         
-        const operations = [];
-        for (let i = 0; i < 10; i++) {
-          operations.push(driverAdapter.queryRaw({ sql: config.testQueries.simple, args: [] }));
+        const operations = 2000;
+        for (let i = 0; i < operations; i++) {
+          await driverAdapter.queryRaw({ sql: config.testQueries.simple, args: [] });
         }
-        await Promise.all(operations);
         
         const endTime = performance.now();
-        return { operations: 10, totalTime: endTime - startTime };
+        return { operations, totalTime: endTime - startTime };
+      },
+    },
+    {
+      name: "CRUD Batch Test",
+      test: async (driverAdapter: any, config: AdapterConfig) => {
+        const tableName = `temp_table_${Math.random().toString(36).slice(2, 10)}`;
+        const replaceTableName = (sql: string) => sql.replace(/test_table/g, tableName);
+
+        // Ensure table exists in a clean state
+        await driverAdapter.queryRaw({ sql: replaceTableName(config.testQueries.drop), args: [] }).catch(() => {});
+        await driverAdapter.queryRaw({ sql: replaceTableName(config.testQueries.create), args: [] });
+
+        const operations = 500;
+
+        const insertArgsTemplate = config.testQueries.insert.args || [];
+        const startTime = performance.now();
+
+        for (let i = 0; i < operations; i++) {
+          const insertArgs = insertArgsTemplate.map((arg, index) => {
+            if (typeof arg === "string" && index === 0) {
+              return `${arg}_${i}`;
+            }
+            if (typeof arg === "number" && index === 1) {
+              return i + 1;
+            }
+            return arg;
+          });
+
+          await driverAdapter.queryRaw({
+            sql: replaceTableName(config.testQueries.insert.sql),
+            args: insertArgs,
+          });
+        }
+
+        for (let i = 0; i < operations; i++) {
+          await driverAdapter.queryRaw({
+            sql: replaceTableName(config.testQueries.select),
+            args: [],
+          });
+        }
+
+        const endTime = performance.now();
+
+        await driverAdapter.queryRaw({ sql: replaceTableName(config.testQueries.drop), args: [] }).catch(() => {});
+
+        return { operations: operations * 2, totalTime: endTime - startTime };
       },
     },
   ];
-
-  const allResults: TestResult[] = [];
 
   for (const testSuite of testSuites) {
     console.log(`📋 Running ${testSuite.name}...`);
@@ -498,6 +680,7 @@ async function runAllTests(): Promise<void> {
   console.log("====================================");
   
   const databases = ["postgresql", "mysql", "sqlite"];
+  const databaseSummaryLines: string[] = [];
   
   const hasComparisons = databases.some(dbType => {
     const dbResults = allResults.filter(r => 
@@ -528,8 +711,17 @@ async function runAllTests(): Promise<void> {
           
           if (speedup > 1) {
             console.log(`  📈 Bun is ${speedup.toFixed(2)}x faster`);
+            databaseSummaryLines.push(`${dbType.toUpperCase()}:`);
+            databaseSummaryLines.push(`  Bun average: ${bunAvg.toFixed(2)}ms`);
+            databaseSummaryLines.push(`  Traditional average: ${prismaAvg.toFixed(2)}ms`);
+            databaseSummaryLines.push(`  Winner: Bun (${speedup.toFixed(2)}x faster)`);
           } else {
-            console.log(`  📉 Prisma is ${(1/speedup).toFixed(2)}x faster`);
+            const inverse = (1 / speedup).toFixed(2);
+            console.log(`  📉 Prisma is ${inverse}x faster`);
+            databaseSummaryLines.push(`${dbType.toUpperCase()}:`);
+            databaseSummaryLines.push(`  Bun average: ${bunAvg.toFixed(2)}ms`);
+            databaseSummaryLines.push(`  Traditional average: ${prismaAvg.toFixed(2)}ms`);
+            databaseSummaryLines.push(`  Winner: Traditional (${inverse}x faster)`);
           }
         }
       }
@@ -544,6 +736,31 @@ async function runAllTests(): Promise<void> {
       successfulResults.forEach(result => {
         const typeIcon = result.type === "bun" ? "🚀" : "🔷";
         console.log(`  ${typeIcon} ${result.adapter}: ${result.duration.toFixed(2)}ms average`);
+      });
+      
+      const grouped = new Map<string, TestResult[]>();
+      successfulResults.forEach(result => {
+        const key = result.provider.toUpperCase();
+        if (!grouped.has(key)) {
+          grouped.set(key, []);
+        }
+        grouped.get(key)!.push(result);
+      });
+      
+      grouped.forEach((providerResults, provider) => {
+        const bun = providerResults.filter(r => r.type === "bun");
+        const prisma = providerResults.filter(r => r.type === "prisma");
+        if (bun.length === 0 && prisma.length === 0) return;
+        
+        databaseSummaryLines.push(`${provider}:`);
+        if (bun.length > 0) {
+          const bunAvg = bun.reduce((sum, r) => sum + r.duration, 0) / bun.length;
+          databaseSummaryLines.push(`  Bun average: ${bunAvg.toFixed(2)}ms`);
+        }
+        if (prisma.length > 0) {
+          const prismaAvg = prisma.reduce((sum, r) => sum + r.duration, 0) / prisma.length;
+          databaseSummaryLines.push(`  Traditional average: ${prismaAvg.toFixed(2)}ms`);
+        }
       });
     }
   }
@@ -587,11 +804,85 @@ async function runAllTests(): Promise<void> {
       console.log("💡 For more comprehensive comparisons, setup PostgreSQL/MySQL databases");
     }
   }
+
+  const executedResults = allResults.filter((r) => !r.skipped);
+  const passedResults = executedResults.filter((r) => r.success);
+  const failedResults = executedResults.length - passedResults.length;
+  const skippedResults = allResults.length - executedResults.length;
+
+  const bunAvailability = availabilityResults.filter((r) => r.type === "bun");
+  const prismaAvailability = availabilityResults.filter((r) => r.type === "prisma");
+
+  const bunExecuted = executedResults.filter((r) => r.type === "bun");
+  const prismaExecuted = executedResults.filter((r) => r.type === "prisma");
+
+  const bunPassCount = bunExecuted.filter((r) => r.success).length;
+  const prismaPassCount = prismaExecuted.filter((r) => r.success).length;
+
+  let overallWinner: "bun" | "prisma" | "tie" | undefined;
+  let differencePct: number | undefined;
+  let overallLine = "Overall winner: Not enough data";
+
+  if (bunExecuted.length > 0 && prismaExecuted.length > 0) {
+    const bunAvgDuration =
+      bunExecuted.reduce((sum, r) => sum + r.duration, 0) / bunExecuted.length;
+    const prismaAvgDuration =
+      prismaExecuted.reduce((sum, r) => sum + r.duration, 0) / prismaExecuted.length;
+
+    if (Math.abs(bunAvgDuration - prismaAvgDuration) < 1e-6) {
+      overallWinner = "tie";
+      differencePct = 0;
+      overallLine = "Overall winner: Tie (0.00% difference)";
+    } else if (bunAvgDuration < prismaAvgDuration && prismaAvgDuration > 0) {
+      overallWinner = "bun";
+      differencePct = ((prismaAvgDuration - bunAvgDuration) / prismaAvgDuration) * 100;
+      overallLine = `Overall winner: Bun adapters (${differencePct.toFixed(2)}% faster)`;
+    } else if (bunAvgDuration > prismaAvgDuration && bunAvgDuration > 0) {
+      overallWinner = "prisma";
+      differencePct = ((bunAvgDuration - prismaAvgDuration) / bunAvgDuration) * 100;
+      overallLine = `Overall winner: Prisma adapters (${differencePct.toFixed(2)}% faster)`;
+    } else {
+      overallWinner = "tie";
+      differencePct = 0;
+      overallLine = "Overall winner: Tie (insufficient data for percentage)";
+    }
+  }
+
+  const summaryText = [
+    `Adapters available: ${availableCount}/${totalCount} (Bun ${bunAvailability.filter(r => r.available).length}/${bunAvailability.length}, Prisma ${prismaAvailability.filter(r => r.available).length}/${prismaAvailability.length})`,
+    `Results: ${passedResults.length} passed, ${failedResults} failed, ${skippedResults} skipped across ${testSuites.length} suites`,
+    `Direct comparisons: ${hasComparisons ? "completed" : "insufficient adapters"}`,
+    bunExecuted.length > 0
+      ? `Bun pass rate: ${bunPassCount}/${bunExecuted.length}`
+      : "Bun adapters not exercised",
+    prismaExecuted.length > 0
+      ? `Prisma pass rate: ${prismaPassCount}/${prismaExecuted.length}`
+      : "Prisma adapters not exercised",
+    overallLine,
+    ...databaseSummaryLines,
+  ].join("\n");
+
+  return {
+    summary: summaryText,
+    availability: availabilityResults,
+    results: allResults,
+    overallWinner,
+    differencePct,
+  };
 }
 
 // Run the tests
+// @ts-ignore -- import.meta.main is only available in ESM runtimes like Bun/Node 18+.
 if (import.meta.main) {
-  runAllTests().catch(console.error);
+  runAllTests()
+    .then(() => {
+      // Ensure Bun/Node exit even if underlying clients keep handles alive
+      process.exit(0);
+    })
+    .catch((error) => {
+      console.error(error);
+      process.exit(1);
+    });
 }
 
 export { runAllTests };

@@ -1,5 +1,8 @@
-import { BunPostgresAdapter, BunMySQLAdapter, BunSQLiteAdapter } from "../src/index.js";
+import { BunPostgresAdapter, BunMySQLAdapter, BunSQLiteAdapter, BunPostgresOptimized } from "../src/index.js";
 import { databases as testDatabases } from "./setup-test-dbs.ts";
+import { createSqlJsDriverAdapter } from "./lib/sqljs-traditional-adapter.ts";
+
+// Summary: Compare Bun-native adapters to traditional drivers through uniform performance benchmarks across supported databases.
 
 const POSTGRES_URL = testDatabases.find((d) => d.name === "PostgreSQL")!.connectionString;
 const MYSQL_URL = testDatabases.find((d) => d.name === "MySQL")!.connectionString;
@@ -22,6 +25,14 @@ interface AdapterConfig {
   provider: string;
   createAdapter: () => Promise<any>;
   connectionString?: string;
+}
+
+interface PerformanceComparisonSummary {
+  summary: string;
+  availability: Array<{ adapter: string; type: "bun" | "traditional"; available: boolean }>;
+  results: BenchmarkResult[];
+  overallWinner?: "bun" | "traditional" | "tie";
+  differencePct?: number;
 }
 
 // Traditional Node.js adapters for comparison
@@ -85,33 +96,22 @@ async function createTraditionalAdapters(): Promise<AdapterConfig[]> {
     console.log("⚠️  mysql2 not available for MySQL comparison");
   }
 
-  // SQLite with better-sqlite3 (if available)
-  try {
-    const Database = await import("better-sqlite3");
-    adapters.push({
-      name: "Traditional SQLite (better-sqlite3)",
-      type: "traditional",
-      provider: "sqlite",
-      createAdapter: async function() {
-        const db = new (Database.default || Database)(":memory:");
-        return {
-          query: async (sql: string, params: any[] = []) => {
-            if (sql.trim().toUpperCase().startsWith("SELECT")) {
-              const stmt = db.prepare(sql);
-              return stmt.all(...params);
-            } else {
-              const stmt = db.prepare(sql);
-              const result = stmt.run(...params);
-              return { affectedRows: result.changes };
-            }
-          },
-          close: () => db.close()
-        };
-      }
-    });
-  } catch (error) {
-    console.log("⚠️  better-sqlite3 not available for SQLite comparison");
-  }
+  // SQLite baseline using sql.js (pure WASM, runs inside Bun without native bindings)
+  adapters.push({
+    name: "Traditional SQLite (sql.js)",
+    type: "traditional",
+    provider: "sqlite",
+    createAdapter: async function() {
+      const driver = await createSqlJsDriverAdapter(":memory:");
+      return {
+        query: async (sql: string, params: any[] = []) => {
+          const result = await driver.query(sql, params);
+          return Array.isArray(result) ? result : [];
+        },
+        close: () => driver.close()
+      };
+    }
+  });
 
   return adapters;
 }
@@ -164,6 +164,26 @@ async function createBunAdapters(): Promise<AdapterConfig[]> {
       provider: "sqlite",
       createAdapter: async function() {
         const adapter = new BunSQLiteAdapter(":memory:");
+        const driverAdapter = await adapter.connect();
+        return {
+          query: async (sql: string, params: any[] = []) => {
+            const result = await driverAdapter.queryRaw({ sql, args: params });
+            return result.rows;
+          },
+          execute: async (sql: string, params: any[] = []) => {
+            return await driverAdapter.executeRaw({ sql, args: params });
+          },
+          close: () => driverAdapter.dispose()
+        };
+      }
+    },
+    {
+      name: "Bun PostgreSQL (Optimized)",
+      type: "bun",
+      provider: "postgresql",
+      connectionString: POSTGRES_URL,
+      createAdapter: async function() {
+        const adapter = new BunPostgresOptimized(this.connectionString!);
         const driverAdapter = await adapter.connect();
         return {
           query: async (sql: string, params: any[] = []) => {
@@ -248,7 +268,7 @@ async function runBenchmark(config: AdapterConfig, operations: number = 100): Pr
   }
 }
 
-async function main(): Promise<void> {
+async function main(): Promise<PerformanceComparisonSummary> {
   console.log("🚀 Bun vs Traditional Adapter Performance Comparison\n");
   
   const bunAdapters = await createBunAdapters();
@@ -266,6 +286,12 @@ async function main(): Promise<void> {
       return { config, available };
     })
   );
+
+  const availabilitySummary = availabilityResults.map(({ config, available }) => ({
+    adapter: config.name,
+    type: config.type,
+    available,
+  }));
   
   const availableAdapters = availabilityResults
     .filter(r => r.available)
@@ -274,7 +300,13 @@ async function main(): Promise<void> {
   if (availableAdapters.length === 0) {
     console.log("\n❌ No adapters available for testing");
     console.log("💡 Setup databases with: bun run setup:dbs");
-    return;
+    return {
+      summary: "No adapters available for benchmarking. Run database setup before executing this suite.",
+      availability: availabilitySummary,
+      results: [],
+      overallWinner: "tie",
+      differencePct: 0,
+    };
   }
   
   console.log(`\n📊 Running performance benchmarks (100 operations each)...\n`);
@@ -307,6 +339,8 @@ async function main(): Promise<void> {
   
   const providers = ["postgresql", "mysql", "sqlite"];
   
+  const databaseSummaryLines: string[] = [];
+
   providers.forEach(provider => {
     const providerResults = results.filter(r => 
       r.provider === provider && r.success
@@ -330,6 +364,16 @@ async function main(): Promise<void> {
         } else {
           console.log(`  📉 Traditional is ${(1/speedupOps).toFixed(2)}x faster`);
         }
+
+        const sectionLines = [
+          `Bun: ${bunResult.opsPerSecond.toFixed(0)} ops/sec (${bunResult.avgTime.toFixed(2)}ms avg)`,
+          `Traditional: ${traditionalResult.opsPerSecond.toFixed(0)} ops/sec (${traditionalResult.avgTime.toFixed(2)}ms avg)`,
+          speedupOps > 1
+            ? `Winner: Bun (${speedupOps.toFixed(2)}x faster)`
+            : `Winner: Traditional (${(1/speedupOps).toFixed(2)}x faster)`
+        ];
+        databaseSummaryLines.push(`${provider.toUpperCase()}:`);
+        sectionLines.forEach(line => databaseSummaryLines.push(`  ${line}`));
       }
       
       // Sort by performance
@@ -356,10 +400,16 @@ async function main(): Promise<void> {
   const bunResults = successfulResults.filter(r => r.type === "bun");
   const traditionalResults = successfulResults.filter(r => r.type === "traditional");
   
+  const bunAvgOps =
+    bunResults.length > 0
+      ? bunResults.reduce((sum, r) => sum + r.opsPerSecond, 0) / bunResults.length
+      : 0;
+  const traditionalAvgOps =
+    traditionalResults.length > 0
+      ? traditionalResults.reduce((sum, r) => sum + r.opsPerSecond, 0) / traditionalResults.length
+      : 0;
+
   if (bunResults.length > 0 && traditionalResults.length > 0) {
-    const bunAvgOps = bunResults.reduce((sum, r) => sum + r.opsPerSecond, 0) / bunResults.length;
-    const traditionalAvgOps = traditionalResults.reduce((sum, r) => sum + r.opsPerSecond, 0) / traditionalResults.length;
-    
     console.log(`🚀 Bun adapters average: ${bunAvgOps.toFixed(0)} ops/sec`);
     console.log(`🔧 Traditional adapters average: ${traditionalAvgOps.toFixed(0)} ops/sec`);
     
@@ -378,6 +428,63 @@ async function main(): Promise<void> {
     console.log("  bun run setup:dbs  # Setup PostgreSQL and MySQL");
     console.log("  bun install        # Install optional dependencies");
   }
+  const successCount = successfulResults.length;
+  const failureCount = results.length - successCount;
+
+  const fastestAdapter = [...successfulResults]
+    .sort((a, b) => b.opsPerSecond - a.opsPerSecond)[0];
+
+  const summaryLines = [
+    `Adapters benchmarked: ${availableAdapters.length}/${allAdapters.length}`,
+    `Results: ${successCount} succeeded, ${failureCount} failed`,
+    fastestAdapter
+      ? `Fastest adapter: ${fastestAdapter.adapter} (${fastestAdapter.opsPerSecond.toFixed(0)} ops/sec)`
+      : "No successful benchmark results",
+  ];
+
+  if (bunResults.length > 0) {
+    summaryLines.push(`Bun average: ${bunAvgOps.toFixed(0)} ops/sec`);
+  }
+
+  if (traditionalResults.length > 0) {
+    summaryLines.push(`Traditional average: ${traditionalAvgOps.toFixed(0)} ops/sec`);
+  }
+
+  summaryLines.push(...databaseSummaryLines);
+
+  let overallWinner: "bun" | "traditional" | "tie" | undefined;
+  let differencePct: number | undefined;
+
+  if (bunResults.length > 0 && traditionalResults.length > 0) {
+    const diff = bunAvgOps - traditionalAvgOps;
+    if (Math.abs(diff) < 1e-6) {
+      overallWinner = "tie";
+      differencePct = 0;
+      summaryLines.push("Overall winner: Tie (0.00% difference)");
+    } else if (bunAvgOps > traditionalAvgOps && traditionalAvgOps > 0) {
+      overallWinner = "bun";
+      differencePct = ((bunAvgOps - traditionalAvgOps) / traditionalAvgOps) * 100;
+      summaryLines.push(`Overall winner: Bun adapters (+${differencePct.toFixed(2)}% ops/sec)`);
+    } else if (bunAvgOps < traditionalAvgOps && bunAvgOps > 0) {
+      overallWinner = "traditional";
+      differencePct = ((traditionalAvgOps - bunAvgOps) / bunAvgOps) * 100;
+      summaryLines.push(`Overall winner: Traditional adapters (+${differencePct.toFixed(2)}% ops/sec)`);
+    } else {
+      overallWinner = "tie";
+      differencePct = 0;
+      summaryLines.push("Overall winner: Tie (insufficient data for percentage)");
+    }
+  } else {
+    summaryLines.push("Overall winner: Not enough data for comparison");
+  }
+
+  return {
+    summary: summaryLines.join("\n"),
+    availability: availabilitySummary,
+    results,
+    overallWinner,
+    differencePct,
+  };
 }
 
 if (import.meta.main) {

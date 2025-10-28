@@ -1,5 +1,7 @@
 const sql = new Bun.sql(process.env.DATABASE_URL);
 
+// Summary: Sanity-check Bun SQL queries against PostgreSQL and inspect result structures.
+
 // Test basic query using tagged template literal
 const query = sql`SELECT COUNT(*) as count FROM users`;
 
