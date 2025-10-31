@@ -1,6 +1,16 @@
 Changelog
 =========
 
+1.1.8 - 2025-10-31
+-------------------
+
+Enhance Postgres adapter with improved argument coercion and connection management. Added support for JSON and array placeholders in SQL queries, ensuring proper handling of parameters. Updated connection pooling logic to pre-warm connections and avoid exhaustion. Introduced schema parameter mapping for search_path in connection strings. Added new test cases for comprehensive coverage. Added 'tests:setup' and 'tests:run' scripts to easily setup and run ALL tests.
+Removed template cache from optimized PG adapter.
+
+1.1.7 - 2025-10-28
+-------------------
+Added run-all-tests.ts,  sql.js dependency for SQLite fallback, update package version, and enhance test scripts for improved database setup and execution. Update performance comparison documentation to reflect changes in SQLite adapter testing methodology.
+
 1.1.6 - 2025-10-27
 -------------------
 Several updates to tests.
