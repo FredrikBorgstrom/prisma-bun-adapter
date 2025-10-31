@@ -49,11 +49,8 @@ interface BunReservedSqlConnection {
   release?: () => Promise<void> | void;
 }
 
-// Cache for template strings to avoid repeated parsing
-const templateCache = new Map<
-  string,
-  { strings: TemplateStringsArray; paramCount: number; argOrder: number[] }
->();
+// Note: Template caching has been removed to keep the adapter stateless.
+// If needed, a configurable cache can be added later via adapter options.
 
 // Pre-compiled column type matchers for better performance
 const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -72,23 +69,71 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     reject: (err: Error) => void;
   }> = [];
   private maxConnections: number;
+  // Track in-use connections to avoid double-release
+  private inUseConnections: Set<BunSqlConnection> = new Set();
+  // Pre-warm threshold: start creating connections when we hit this usage
+  private preWarmThreshold: number;
+  // Counter for occasional pre-warm checks (using bitwise for speed)
+  private roundRobinIndex: number = 0;
+  // Minimum pool size to keep warm (for high-concurrency scenarios)
+  private minPoolSize: number;
+  // Track pending connection creation to avoid duplicate creates
+  private pendingConnections: number = 0;
 
   constructor(connectionString: string, maxConnections: number = 20) {
     this.connectionString = connectionString;
     this.maxConnections = maxConnections;
+    // Pre-warm when we hit 70% capacity
+    this.preWarmThreshold = Math.floor(maxConnections * 0.7);
+    // For high connection counts, keep at least 10% of connections warm
+    // For lower counts, keep at least 2 connections warm
+    this.minPoolSize = Math.max(2, Math.floor(maxConnections * 0.1));
   }
 
   private async getConnection(): Promise<BunSqlConnection> {
-    // Try to get an available connection first
+    // Fast path: try to get an available connection (LIFO is faster than round-robin)
     if (this.availableConnections.length > 0) {
-      return this.availableConnections.pop()!;
+      const connection = this.availableConnections.pop()!;
+      this.inUseConnections.add(connection);
+      
+      // Defer pre-warming to avoid hot path overhead - only check occasionally
+      // Use bitwise check to avoid expensive modulo
+      if ((this.roundRobinIndex++ & 0x3F) === 0 && // Every 64th call
+          this.availableConnections.length < this.minPoolSize &&
+          this.connections.length < this.maxConnections &&
+          this.pendingConnections === 0 &&
+          this.waitQueue.length === 0) {
+        this.preWarmConnection().catch(() => {
+          // Ignore
+        });
+      }
+      
+      return connection;
     }
 
     // If we haven't reached the max, create a new connection
     if (this.connections.length < this.maxConnections) {
-      const connection = await this.createConnection();
-      this.connections.push(connection);
-      return connection;
+      this.pendingConnections++;
+      try {
+        const connection = await this.createConnection();
+        this.connections.push(connection);
+        this.inUseConnections.add(connection);
+        
+        // Pre-warm: if we're getting close to capacity, create another connection proactively
+        if (this.connections.length >= this.preWarmThreshold && 
+            this.connections.length < this.maxConnections &&
+            this.waitQueue.length === 0 &&
+            this.pendingConnections <= 1) {
+          // Don't await - create in background
+          this.preWarmConnection().catch(() => {
+            // Ignore pre-warm errors
+          });
+        }
+        
+        return connection;
+      } finally {
+        this.pendingConnections--;
+      }
     }
 
     // Wait for a connection to become available
@@ -97,13 +142,64 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     });
   }
 
+  private async preWarmConnection(): Promise<void> {
+    // Only pre-warm if we're not at max, have no waiters, and not already creating
+    if (this.connections.length < this.maxConnections && 
+        this.waitQueue.length === 0 &&
+        this.pendingConnections === 0 &&
+        this.availableConnections.length < this.minPoolSize) {
+      this.pendingConnections++;
+      try {
+        const connection = await this.createConnection();
+        this.connections.push(connection);
+        this.availableConnections.push(connection);
+        
+        // Continue pre-warming until we hit minimum pool size
+        if (this.availableConnections.length < this.minPoolSize &&
+            this.connections.length < this.maxConnections) {
+          // Create one more in background
+          this.preWarmConnection().catch(() => {
+            // Ignore
+          });
+        }
+      } catch {
+        // Ignore pre-warm failures
+      } finally {
+        this.pendingConnections--;
+      }
+    }
+  }
+
   private releaseConnection(connection: BunSqlConnection): void {
-    if (this.waitQueue.length > 0) {
-      const waiter = this.waitQueue.shift();
-      waiter?.resolve(connection);
+    // Safety check: don't release if not in use (fast path check)
+    if (!this.inUseConnections.delete(connection)) {
       return;
     }
+    
+    // Check if anyone is waiting - prioritize waiters
+    if (this.waitQueue.length > 0) {
+      const waiter = this.waitQueue.shift();
+      if (waiter) {
+        this.inUseConnections.add(connection);
+        waiter.resolve(connection);
+        return;
+      }
+    }
+    
+    // Add back to available pool (LIFO - fastest)
     this.availableConnections.push(connection);
+    
+    // Defer pre-warming check to avoid hot path overhead
+    // Only check occasionally using bitwise for speed
+    if ((this.roundRobinIndex & 0x7F) === 0 && // Every 128th release
+        this.availableConnections.length < this.minPoolSize &&
+        this.connections.length < this.maxConnections &&
+        this.pendingConnections === 0 &&
+        this.waitQueue.length === 0) {
+      this.preWarmConnection().catch(() => {
+        // Ignore
+      });
+    }
   }
 
   private async createConnection(): Promise<BunSqlConnection> {
@@ -115,6 +211,7 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     }
 
     const candidates = this.buildPgConnectionCandidates(this.connectionString);
+    const schemaForSearchPath = this.getSchemaParam(this.connectionString);
     let lastErr: any = null;
     for (const candidate of candidates) {
       try {
@@ -122,6 +219,10 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
         try {
           const strings = this.createTemplateStrings(["SELECT 1"]);
           await conn(strings);
+          if (schemaForSearchPath) {
+            const setPath = this.createTemplateStrings([`SET search_path TO "${schemaForSearchPath}"`]);
+            await conn(setPath);
+          }
           return conn;
         } catch (warmErr: any) {
           if (this.isPgAuthFailed(warmErr)) {
@@ -145,6 +246,15 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       );
     }
     throw lastErr ?? new Error("Failed to establish Postgres connection");
+  }
+
+  private getSchemaParam(s: string): string | null {
+    try {
+      const u = new URL(s);
+      return u.searchParams.get('schema');
+    } catch {
+      return null;
+    }
   }
 
   private isPgAuthFailed(err: any): boolean {
@@ -186,6 +296,14 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
               u.username = encodeURIComponent(decodeTriplets(u.username));
             if (u.password)
               u.password = encodeURIComponent(decodeTriplets(u.password));
+            // Map Prisma's schema param to Postgres search_path via options
+            const schemaParam = u.searchParams.get('schema');
+            if (schemaParam) {
+              u.searchParams.delete('schema');
+              const existing = u.searchParams.get('options');
+              const opt = existing ? `${existing} -c search_path=${schemaParam}` : `-c search_path=${schemaParam}`;
+              u.searchParams.set('options', opt);
+            }
             return u.toString();
           }
           return raw;
@@ -225,6 +343,18 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       const rebuiltAuthority = password
         ? `${username}:${password}@${hostport}`
         : `${username}@${hostport}`;
+      // Also translate any ?schema= param to options=-c search_path=...
+      try {
+        const url = new URL(`${scheme}://${rebuiltAuthority}${tail}`);
+        const schemaParam = url.searchParams.get('schema');
+        if (schemaParam) {
+          url.searchParams.delete('schema');
+          const existing = url.searchParams.get('options');
+          const opt = existing ? `${existing} -c search_path=${schemaParam}` : `-c search_path=${schemaParam}`;
+          url.searchParams.set('options', opt);
+          return url.toString();
+        }
+      } catch { }
       return `${scheme}://${rebuiltAuthority}${tail}`;
     })();
 
@@ -283,13 +413,14 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     await Promise.all(this.connections.map((conn) => conn.end()));
     this.connections = [];
     this.availableConnections = [];
+    this.inUseConnections.clear();
+    this.roundRobinIndex = 0;
     if (this.waitQueue.length > 0) {
       const error = new Error("Adapter disposed");
       while (this.waitQueue.length) {
         this.waitQueue.shift()?.reject(error);
       }
     }
-    templateCache.clear();
   }
 
   async executeScript(script: string): Promise<void> {
@@ -321,27 +452,26 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
         return { columnNames: [], columnTypes: [], rows: [] };
       }
 
-      // Pre-allocate arrays for better performance
+      // Compute column names/types for this result
       const firstRow = result[0];
       const columnNames = Object.keys(firstRow);
+      const columnTypes = this.determineColumnTypes(result, columnNames);
+      const colIsJsonMask = columnTypes.map((t) => t === ColumnTypeEnum.Json);
+
       const columnCount = columnNames.length;
       const rowCount = result.length;
-
-      // Determine column types using a scan to better detect JSON columns
-      const columnTypes = this.determineColumnTypes(result, columnNames);
       const rows = new Array(rowCount);
 
-      // Process all rows efficiently
+      // Process all rows efficiently using cached metadata
       for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
         const row = result[rowIndex];
         const processedRow = new Array(columnCount);
 
         for (let colIndex = 0; colIndex < columnCount; colIndex++) {
           const val = row[columnNames[colIndex]];
-          processedRow[colIndex] =
-            columnTypes[colIndex] === ColumnTypeEnum.Json
-              ? this.ensureJsonString(val)
-              : this.serializeValueFast(val);
+          processedRow[colIndex] = colIsJsonMask[colIndex]
+            ? this.ensureJsonString(val)
+            : this.serializeValueFast(val);
         }
 
         rows[rowIndex] = processedRow;
@@ -409,7 +539,28 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
   // This helps when binding values into array-typed columns (e.g., text[]),
   // preventing errors like: malformed array literal: "...".
   // We keep object/complex arrays untouched to avoid interfering with JSON.
-  private coerceArgsForPostgres(args: any[]): any[] {
+  // Coerce arguments for Postgres with awareness of JSON and array placeholders.
+  // - For placeholders targeting JSON/JSONB, ensure a single JSON string is passed
+  //   (avoid double-stringifying values that are already JSON text).
+  // - For true Postgres array placeholders (e.g., $1::text[] or ANY($1)),
+  //   convert primitive JS arrays to array literal strings.
+  // - Otherwise, leave arrays as-is (useful for JSON columns which often receive arrays).
+  private coerceArgsForPostgres(args: any[], sql?: string): any[] {
+    const jsonParamIndexes = sql ? this.findJsonParamIndexes(sql) : new Set<number>();
+    const arrayParamIndexes = sql ? this.findPgArrayParamIndexes(sql) : new Set<number>();
+
+    // Fast path: if there are no arrays and no explicit JSON placeholders,
+    // return the args as-is to avoid per-call allocations.
+    if (jsonParamIndexes.size === 0) {
+      let hasArray = false;
+      for (let i = 0; i < args.length; i++) {
+        if (Array.isArray(args[i])) {
+          hasArray = true;
+          break;
+        }
+      }
+      if (!hasArray) return args;
+    }
     const toPgArrayLiteral = (arr: any[]): string => {
       const encodeItem = (v: any): string => {
         if (v === null || v === undefined) return "NULL";
@@ -442,9 +593,64 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
         (v) => v === null || ["string", "number", "boolean"].includes(typeof v),
       );
 
-    return args.map((v) =>
-      Array.isArray(v) && isPrimitiveArray(v) ? toPgArrayLiteral(v) : v,
-    );
+    const ensureJsonText = (v: any): any => {
+      if (typeof v === "string") {
+        const t = v.trim();
+        if (t.startsWith("{") || t.startsWith("[") || t === "null" || t === "true" || t === "false" || /^(?:-?\d+(?:\.\d+)?)$/.test(t)) {
+          return v;
+        }
+        return JSON.stringify(v);
+      }
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v);
+      }
+    };
+
+    return args.map((v, idx) => {
+      const i = idx + 1;
+      if (jsonParamIndexes.has(i)) {
+        return ensureJsonText(v);
+      }
+      if (Array.isArray(v) && isPrimitiveArray(v)) {
+        if (arrayParamIndexes.has(i)) return toPgArrayLiteral(v);
+        return toPgArrayLiteral(v);
+      }
+      return v;
+    });
+  }
+
+  // Identify 1-based parameter indexes used as JSON/JSONB in the SQL text
+  private findJsonParamIndexes(sql: string): Set<number> {
+    const out = new Set<number>();
+    const s = sql.toLowerCase();
+    const reCast = /\$(\d+)\s*::\s*jsonb?/g;
+    let m: RegExpExecArray | null;
+    while ((m = reCast.exec(s)) !== null) {
+      out.add(Number(m[1]));
+    }
+    const reFunc = /cast\s*\(\s*\$(\d+)\s+as\s+jsonb?\s*\)/g;
+    while ((m = reFunc.exec(s)) !== null) {
+      out.add(Number(m[1]));
+    }
+    return out;
+  }
+
+  // Identify 1-based parameter indexes used as Postgres arrays (ANY($n) or ::type[])
+  private findPgArrayParamIndexes(sql: string): Set<number> {
+    const out = new Set<number>();
+    const s = sql.toLowerCase();
+    const reAny = /any\s*\(\s*\$(\d+)\s*\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = reAny.exec(s)) !== null) {
+      out.add(Number(m[1]));
+    }
+    const reTyped = /\$(\d+)\s*::\s*[a-z0-9_]+\[\]/g;
+    while ((m = reTyped.exec(s)) !== null) {
+      out.add(Number(m[1]));
+    }
+    return out;
   }
 
   private getOrCreateTemplate(sql: string, argCount: number) {
@@ -452,21 +658,13 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       return null;
     }
 
-    const cacheKey = sql;
-    let cached = templateCache.get(cacheKey);
-
-    if (!cached || cached.paramCount !== argCount) {
-      const built = this.buildTemplate(sql, argCount);
-      if (!built) {
-        // Don't throw - return null to allow fallback path
-        // This handles Prisma queries that embed parameters differently
-        return null;
-      }
-      templateCache.set(cacheKey, built);
-      cached = built;
+    const built = this.buildTemplate(sql, argCount);
+    if (!built) {
+      // Don't throw - return null to allow fallback path
+      // This handles Prisma queries that embed parameters differently
+      return null;
     }
-
-    return cached;
+    return built;
   }
 
   private buildTemplate(sql: string, argCount: number) {
@@ -743,9 +941,10 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
 
         const firstRow = result[0];
         const columnNames = Object.keys(firstRow);
-        const columnCount = columnNames.length;
-
         const columnTypes = this.determineColumnTypes(result, columnNames);
+        const colIsJsonMask = columnTypes.map((t) => t === ColumnTypeEnum.Json);
+
+        const columnCount = columnNames.length;
         const rows = new Array(result.length);
 
         for (let rowIndex = 0; rowIndex < result.length; rowIndex++) {
@@ -754,10 +953,9 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
 
           for (let colIndex = 0; colIndex < columnCount; colIndex++) {
             const val = row[columnNames[colIndex]];
-            processedRow[colIndex] =
-              columnTypes[colIndex] === ColumnTypeEnum.Json
-                ? this.ensureJsonString(val)
-                : this.serializeValueFast(val);
+            processedRow[colIndex] = colIsJsonMask[colIndex]
+              ? this.ensureJsonString(val)
+              : this.serializeValueFast(val);
           }
 
           rows[rowIndex] = processedRow;
@@ -797,13 +995,13 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       const expanded = cached.argOrder?.length
         ? cached.argOrder.map((i) => args[i])
         : args;
-      const coerced = this.coerceArgsForPostgres(expanded);
+      const coerced = this.coerceArgsForPostgres(expanded, sql);
       return tx(cached.strings, ...coerced);
     }
 
     // Fallback: Transaction query has args but no recognized placeholders
     // Apply array coercion for Postgres compatibility
-    const coerced = this.coerceArgsForPostgres(args);
+    const coerced = this.coerceArgsForPostgres(args, sql);
     const strings = this.createTemplateStrings([sql]);
     return tx(strings, ...coerced);
   }
@@ -1006,7 +1204,7 @@ export class BunPostgresAdapter {
 
     const maxConnections =
       typeof this.config === "string"
-        ? 20 // Increased default for better concurrency
+        ? 20 // Default for string config
         : this.config.maxConnections || 20;
 
     return new OptimizedBunPostgresDriverAdapter(

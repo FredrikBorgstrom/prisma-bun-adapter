@@ -1,0 +1,64 @@
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/panda-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("PANDA_DATABASE_URL")
+}
+
+model Organization {
+  id        String @id @default(cuid(2))
+  subdomain String @unique
+  name      String
+
+  address String?
+  phone   String?
+  email   String?
+  active  Boolean @default(true)
+
+  encryptionKey String
+  keyVersion    Int      @default(1)
+  keyRotatedAt  DateTime @default(now())
+
+  subscriptionPlan   String  @default("trial")
+  subscriptionStatus String  @default("active")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  settings    OrganizationSettings?
+  roles       OrganizationRole[]
+
+  @@map("organization")
+}
+
+model OrganizationSettings {
+  id String @id @default(cuid(2))
+  timezone String @default("Europe/Berlin")
+  locale   String @default("de-DE")
+  customSettings Json @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  organizationId String @unique
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@map("organization_settings")
+}
+
+model OrganizationRole {
+  id          String   @id @default(cuid(2))
+  name        String
+  description String?
+  isSystem    Boolean  @default(false)
+  permissions String[]
+  color       String?  @default("#6b7280")
+  priority    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  @@unique([organizationId, name])
+  @@map("organization_role")
+}

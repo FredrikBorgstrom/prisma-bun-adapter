@@ -40,6 +40,7 @@
     "test:performance": "bun test-app/performance-comparison.ts",
     "test:prisma:complex": "bun test-app/complex-prisma-benchmarks.ts",
     "test:sql:complex": "bun test-app/complex-sql-benchmarks.ts",
+    "test:panda": "bun test-app/panda-organization-role.ts",
     "demo:sqlite": "bun run test-app/sqlite-comparison-demo.ts",
     "demo:quick": "bun test-app/quick-comparison-demo.ts",
     "publish": "bun run build && npm publish"

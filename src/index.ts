@@ -247,7 +247,16 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
 
   // Convert primitive JS arrays to a Postgres array literal string for array-typed columns.
   // Leaves complex/object arrays untouched to avoid interfering with JSON payloads.
-  protected coerceArgsForPostgres(args: any[]): any[] {
+  // Coerce arguments for Postgres with awareness of JSON and array placeholders.
+  // - For placeholders targeting JSON/JSONB, ensure a single JSON string is passed
+  //   (avoid double-stringifying values that are already JSON text).
+  // - For true Postgres array placeholders (e.g., $1::text[] or ANY($1)),
+  //   convert primitive JS arrays to array literal strings.
+  // - Otherwise, leave arrays as-is (useful for JSON columns which often receive arrays).
+  protected coerceArgsForPostgres(args: any[], sql?: string): any[] {
+    const jsonParamIndexes = sql ? this.findJsonParamIndexes(sql) : new Set<number>();
+    const arrayParamIndexes = sql ? this.findPgArrayParamIndexes(sql) : new Set<number>();
+
     const toPgArrayLiteral = (arr: any[]): string => {
       const encodeItem = (v: any): string => {
         if (v === null || v === undefined) return "NULL";
@@ -280,9 +289,70 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
         (v) => v === null || ["string", "number", "boolean"].includes(typeof v),
       );
 
-    return args.map((v) =>
-      Array.isArray(v) && isPrimitiveArray(v) ? toPgArrayLiteral(v) : v,
-    );
+    const ensureJsonText = (v: any): any => {
+      // If it's already a string that looks like JSON, pass through
+      if (typeof v === "string") {
+        const t = v.trim();
+        if (t.startsWith("{") || t.startsWith("[") || t === "null" || t === "true" || t === "false" || /^(?:-?\d+(?:\.\d+)?)$/.test(t)) {
+          return v;
+        }
+        // Otherwise, treat as a plain string value that needs JSON quoting
+        return JSON.stringify(v);
+      }
+      // For non-strings, send a single JSON string
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v);
+      }
+    };
+
+    return args.map((v, idx) => {
+      const i = idx + 1; // SQL placeholders are 1-based
+      if (jsonParamIndexes.has(i)) {
+        return ensureJsonText(v);
+      }
+      // For primitive arrays, prefer PG array literal unless this param is JSON
+      if (Array.isArray(v) && isPrimitiveArray(v)) {
+        if (arrayParamIndexes.has(i)) return toPgArrayLiteral(v);
+        // Heuristic: if not explicitly JSON, treat as array literal so Postgres infers column type
+        return toPgArrayLiteral(v);
+      }
+      return v;
+    });
+  }
+
+  // Identify 1-based parameter indexes used as JSON/JSONB in the SQL text
+  protected findJsonParamIndexes(sql: string): Set<number> {
+    const out = new Set<number>();
+    const s = sql.toLowerCase();
+    // Patterns: $1::json, $2::jsonb, cast($3 as jsonb)
+    const reCast = /\$(\d+)\s*::\s*jsonb?/g;
+    let m: RegExpExecArray | null;
+    while ((m = reCast.exec(s)) !== null) {
+      out.add(Number(m[1]));
+    }
+    const reFunc = /cast\s*\(\s*\$(\d+)\s+as\s+jsonb?\s*\)/g;
+    while ((m = reFunc.exec(s)) !== null) {
+      out.add(Number(m[1]));
+    }
+    return out;
+  }
+
+  // Identify 1-based parameter indexes used as Postgres arrays (ANY($n) or ::type[])
+  protected findPgArrayParamIndexes(sql: string): Set<number> {
+    const out = new Set<number>();
+    const s = sql.toLowerCase();
+    const reAny = /any\s*\(\s*\$(\d+)\s*\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = reAny.exec(s)) !== null) {
+      out.add(Number(m[1]));
+    }
+    const reTyped = /\$(\d+)\s*::\s*[a-z0-9_]+\[\]/g;
+    while ((m = reTyped.exec(s)) !== null) {
+      out.add(Number(m[1]));
+    }
+    return out;
   }
 
   // Normalize and encode credentials in connection string to avoid URI errors
@@ -317,6 +387,14 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
           parsed.username = encodeURIComponent(decodeTriplets(parsed.username));
         if (parsed.password)
           parsed.password = encodeURIComponent(decodeTriplets(parsed.password));
+        // Map Prisma's schema param to Postgres search_path via options
+        const schemaParam = parsed.searchParams.get('schema');
+        if (schemaParam) {
+          parsed.searchParams.delete('schema');
+          const existing = parsed.searchParams.get('options');
+          const opt = existing ? `${existing} -c search_path=${schemaParam}` : `-c search_path=${schemaParam}`;
+          parsed.searchParams.set('options', opt);
+        }
         return parsed.toString();
       }
       return raw;
@@ -664,7 +742,7 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
       const expanded = argOrder.length ? argOrder.map((i) => args[i]) : args;
       const finalArgs =
         this.provider === "postgres"
-          ? this.coerceArgsForPostgres(expanded)
+          ? this.coerceArgsForPostgres(expanded, sql)
           : expanded;
       return tx(strings, ...finalArgs);
     }
@@ -672,7 +750,7 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
     // Fallback: Transaction query has args but no recognized placeholders
     // Apply array coercion for Postgres compatibility
     const coercedArgs =
-      this.provider === "postgres" ? this.coerceArgsForPostgres(args) : args;
+      this.provider === "postgres" ? this.coerceArgsForPostgres(args, sql) : args;
     const strings = this.createTemplateStrings([sql]);
     return tx(strings, ...coercedArgs);
   }
@@ -776,6 +854,7 @@ class BunPostgresDriverAdapter extends BaseBunDriverAdapter {
     }
 
     const candidates = this.buildPgConnectionCandidates(this.connectionString);
+    const schemaForSearchPath = this.getSchemaParam(this.connectionString);
     let lastErr: any = null;
     for (const candidate of candidates) {
       try {
@@ -783,6 +862,11 @@ class BunPostgresDriverAdapter extends BaseBunDriverAdapter {
         try {
           const strings = this.createTemplateStrings(["SELECT 1"]);
           await conn(strings);
+          // Apply search_path if a ?schema= param was provided
+          if (schemaForSearchPath) {
+            const setPath = this.createTemplateStrings([`SET search_path TO "${schemaForSearchPath}"`]);
+            await conn(setPath);
+          }
           return conn;
         } catch (warmErr: any) {
           if (this.isPgAuthFailed(warmErr)) {
@@ -807,6 +891,15 @@ class BunPostgresDriverAdapter extends BaseBunDriverAdapter {
       );
     }
     throw lastErr ?? new Error("Failed to establish Postgres connection");
+  }
+
+  private getSchemaParam(s: string): string | null {
+    try {
+      const u = new URL(s);
+      return u.searchParams.get('schema');
+    } catch {
+      return null;
+    }
   }
 
   private isPgAuthFailed(err: any): boolean {

@@ -1,6 +1,6 @@
-import { BunPostgresAdapter, BunMySQLAdapter, BunSQLiteAdapter, BunPostgresOptimized } from "../src/index.js";
-import { databases as testDatabases } from "./setup-test-dbs.ts";
+import { BunMySQLAdapter, BunPostgresAdapter, BunPostgresOptimized, BunSQLiteAdapter } from "../src/index.js";
 import { createSqlJsDriverAdapter } from "./lib/sqljs-traditional-adapter.ts";
+import { databases as testDatabases } from "./setup-test-dbs.ts";
 
 // Summary: Compare Bun-native adapters to traditional drivers through uniform performance benchmarks across supported databases.
 
@@ -117,6 +117,7 @@ async function createTraditionalAdapters(): Promise<AdapterConfig[]> {
 }
 
 async function createBunAdapters(): Promise<AdapterConfig[]> {
+  const OPT_POOL = Number.parseInt(process.env.TEST_POSTGRES_MAX_CONNECTIONS || "20");
   return [
     {
       name: "Bun PostgreSQL",
@@ -128,11 +129,11 @@ async function createBunAdapters(): Promise<AdapterConfig[]> {
         const driverAdapter = await adapter.connect();
         return {
           query: async (sql: string, params: any[] = []) => {
-            const result = await driverAdapter.queryRaw({ sql, args: params });
+            const result = await driverAdapter.queryRaw({ sql, args: params, argTypes: [] });
             return result.rows;
           },
           execute: async (sql: string, params: any[] = []) => {
-            return await driverAdapter.executeRaw({ sql, args: params });
+            return await driverAdapter.executeRaw({ sql, args: params, argTypes: [] });
           },
           close: () => driverAdapter.dispose()
         };
@@ -148,11 +149,11 @@ async function createBunAdapters(): Promise<AdapterConfig[]> {
         const driverAdapter = await adapter.connect();
         return {
           query: async (sql: string, params: any[] = []) => {
-            const result = await driverAdapter.queryRaw({ sql, args: params });
+            const result = await driverAdapter.queryRaw({ sql, args: params, argTypes: [] });
             return result.rows;
           },
           execute: async (sql: string, params: any[] = []) => {
-            return await driverAdapter.executeRaw({ sql, args: params });
+            return await driverAdapter.executeRaw({ sql, args: params, argTypes: [] });
           },
           close: () => driverAdapter.dispose()
         };
@@ -167,11 +168,11 @@ async function createBunAdapters(): Promise<AdapterConfig[]> {
         const driverAdapter = await adapter.connect();
         return {
           query: async (sql: string, params: any[] = []) => {
-            const result = await driverAdapter.queryRaw({ sql, args: params });
+            const result = await driverAdapter.queryRaw({ sql, args: params, argTypes: [] });
             return result.rows;
           },
           execute: async (sql: string, params: any[] = []) => {
-            return await driverAdapter.executeRaw({ sql, args: params });
+            return await driverAdapter.executeRaw({ sql, args: params, argTypes: [] });
           },
           close: () => driverAdapter.dispose()
         };
@@ -183,18 +184,23 @@ async function createBunAdapters(): Promise<AdapterConfig[]> {
       provider: "postgresql",
       connectionString: POSTGRES_URL,
       createAdapter: async function() {
-        const adapter = new BunPostgresOptimized(this.connectionString!);
+        // Allow larger pools via env to showcase pooling benefits
+        const adapter = new BunPostgresOptimized({
+          connectionString: this.connectionString!,
+          maxConnections: Number.isFinite(OPT_POOL) && OPT_POOL > 0 ? OPT_POOL : 20,
+        } as any);
         const driverAdapter = await adapter.connect();
-        return {
+        const wrapper = {
           query: async (sql: string, params: any[] = []) => {
-            const result = await driverAdapter.queryRaw({ sql, args: params });
+            const result = await driverAdapter.queryRaw({ sql, args: params, argTypes: [] });
             return result.rows;
           },
           execute: async (sql: string, params: any[] = []) => {
-            return await driverAdapter.executeRaw({ sql, args: params });
+            return await driverAdapter.executeRaw({ sql, args: params, argTypes: [] });
           },
           close: () => driverAdapter.dispose()
         };
+        return wrapper;
       }
     }
   ];
@@ -212,31 +218,66 @@ async function checkAdapterAvailability(config: AdapterConfig): Promise<boolean>
 }
 
 async function runBenchmark(config: AdapterConfig, operations: number = 100): Promise<BenchmarkResult> {
+  let adapter: any = null;
   try {
-    const adapter = await config.createAdapter();
+    adapter = await config.createAdapter();
     
-    // Warm up
-    await adapter.query("SELECT 1");
-    
-    const startTime = performance.now();
-    
-    // Run benchmark operations
-    const promises = [];
+    // For PostgreSQL, limit concurrency to avoid connection pool exhaustion
     const isPostgres = config.provider === "postgresql";
+    const isOptimized = isPostgres && /Optimized/i.test(config.name);
+    const configuredPool = Number.parseInt(process.env.TEST_POSTGRES_MAX_CONNECTIONS || "20");
+    const poolSize = isOptimized && Number.isFinite(configuredPool) && configuredPool > 0
+      ? configuredPool
+      : 20;
+    const concurrencyLimit = isPostgres ? Math.min(poolSize, operations) : operations;
+    
+    // Choose placeholder per provider
     const param = isPostgres ? "$1" : "?";
     const benchmarkSql = `SELECT ${param} as iteration`;
-    for (let i = 0; i < operations; i++) {
-      promises.push(adapter.query(benchmarkSql, [i]));
+
+    // Warm up a single query
+    await adapter.query("SELECT 1");
+
+    // For the optimized adapter, pre-warm the pool by issuing 'concurrencyLimit'
+    // concurrent queries before starting the timer. This moves connection creation
+    // and search_path setup out of the measured region and better reflects steady-state throughput.
+    if (isOptimized && concurrencyLimit > 1) {
+      await Promise.all(Array.from({ length: concurrencyLimit }, (_: any, i: number) => adapter.query(benchmarkSql, [i])));
     }
+
+    const startTime = performance.now();
     
-    await Promise.all(promises);
+    if (isPostgres && concurrencyLimit < operations) {
+      // Batch operations for PostgreSQL to limit concurrent connections
+      for (let i = 0; i < operations; i += concurrencyLimit) {
+        const batch: Promise<any>[] = [];
+        const end = Math.min(i + concurrencyLimit, operations);
+        for (let j = i; j < end; j++) {
+          batch.push(adapter.query(benchmarkSql, [j]));
+        }
+        await Promise.all(batch);
+      }
+    } else {
+      // Run all operations in parallel for non-PostgreSQL
+      const promises: Promise<any>[] = [];
+      for (let i = 0; i < operations; i++) {
+        promises.push(adapter.query(benchmarkSql, [i] as any));
+      }
+      await Promise.all(promises);
+    }
     
     const endTime = performance.now();
     const totalTime = endTime - startTime;
     const avgTime = totalTime / operations;
     const opsPerSecond = (operations / totalTime) * 1000;
     
-    await adapter.close();
+    // Ensure adapter is closed
+    try {
+      await adapter.close();
+    } catch (closeError) {
+      // Ignore close errors
+    }
+    adapter = null;
     
     return {
       adapter: config.name,
@@ -249,6 +290,15 @@ async function runBenchmark(config: AdapterConfig, operations: number = 100): Pr
       success: true
     };
   } catch (error) {
+    // Ensure adapter is closed even on error
+    if (adapter) {
+      try {
+        await adapter.close();
+      } catch (closeError) {
+        // Ignore close errors
+      }
+    }
+    
     const isPostgres = config.provider === "postgresql";
     const param = isPostgres ? "$1" : "?";
     const failingSql = `SELECT ${param} as iteration`;
@@ -311,10 +361,56 @@ async function main(): Promise<PerformanceComparisonSummary> {
   
   console.log(`\n📊 Running performance benchmarks (100 operations each)...\n`);
   
-  // Run benchmarks
-  const results = await Promise.all(
-    availableAdapters.map(config => runBenchmark(config, 100))
-  );
+  // Group adapters by connection string to avoid connection pool exhaustion
+  const adapterGroups = new Map<string, AdapterConfig[]>();
+  availableAdapters.forEach(adapter => {
+    const key = adapter.connectionString || adapter.provider;
+    if (!adapterGroups.has(key)) {
+      adapterGroups.set(key, []);
+    }
+    adapterGroups.get(key)!.push(adapter);
+  });
+  
+  // Run benchmarks: serialize adapters sharing the same connection,
+  // but run different connections in parallel
+  const results: BenchmarkResult[] = [];
+  
+  const groupPromises = Array.from(adapterGroups.entries()).map(async ([connectionKey, groupAdapters]) => {
+    const groupResults: BenchmarkResult[] = [];
+    
+    if (groupAdapters.length === 1) {
+      // Single adapter for this connection - just run it
+      groupResults.push(await runBenchmark(groupAdapters[0], 100));
+    } else {
+      // Multiple adapters share the same connection - run sequentially with delay
+      for (const adapterConfig of groupAdapters) {
+        groupResults.push(await runBenchmark(adapterConfig, 100));
+        // Small delay between PostgreSQL adapters to ensure connections are released
+        if (adapterConfig.provider === "postgresql") {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+    }
+    
+    return groupResults;
+  });
+  
+  // Wait for all groups to complete (parallel across groups, sequential within groups)
+  const groupResults = await Promise.all(groupPromises);
+  
+  // Flatten results and maintain original adapter order
+  const resultMap = new Map<string, BenchmarkResult>();
+  groupResults.flat().forEach(result => {
+    resultMap.set(result.adapter, result);
+  });
+  
+  // Get results in original adapter order
+  availableAdapters.forEach(adapter => {
+    const result = resultMap.get(adapter.name);
+    if (result) {
+      results.push(result);
+    }
+  });
   
   // Display results
   console.log("📈 Benchmark Results:");

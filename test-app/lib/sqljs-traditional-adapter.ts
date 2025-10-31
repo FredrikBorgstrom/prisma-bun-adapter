@@ -1,3 +1,4 @@
+/// <reference types="bun" />
 import initSqlJs, { Database, SqlJsStatic } from "sql.js";
 
 type QueryRow = Record<string, any>;

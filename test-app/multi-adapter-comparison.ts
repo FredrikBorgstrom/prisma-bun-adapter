@@ -242,13 +242,21 @@ async function runAllTests(): Promise<AdapterRunSummary> {
     {
       name: "Table Creation Test",
       test: async (driverAdapter: any, queries: any) => {
+        // Drop table first to ensure clean state
+        await driverAdapter.executeRaw({ sql: queries.drop, args: [] }).catch(() => {
+          // Ignore errors if table doesn't exist
+        });
         return await driverAdapter.executeRaw({ sql: queries.create, args: [] });
       },
     },
     {
       name: "Insert Test",
       test: async (driverAdapter: any, queries: any) => {
-        // First ensure table exists
+        // Drop table first to ensure clean state
+        await driverAdapter.executeRaw({ sql: queries.drop, args: [] }).catch(() => {
+          // Ignore errors if table doesn't exist
+        });
+        // Then create the table
         await driverAdapter.executeRaw({ sql: queries.create, args: [] });
         return await driverAdapter.executeRaw(queries.insert);
       },
@@ -256,6 +264,10 @@ async function runAllTests(): Promise<AdapterRunSummary> {
     {
       name: "Select Test",
       test: async (driverAdapter: any, queries: any) => {
+        // Drop table first to ensure clean state
+        await driverAdapter.executeRaw({ sql: queries.drop, args: [] }).catch(() => {
+          // Ignore errors if table doesn't exist
+        });
         // Ensure table exists and has data
         await driverAdapter.executeRaw({ sql: queries.create, args: [] });
         await driverAdapter.executeRaw(queries.insert);
@@ -265,6 +277,10 @@ async function runAllTests(): Promise<AdapterRunSummary> {
     {
       name: "Update Test",
       test: async (driverAdapter: any, queries: any) => {
+        // Drop table first to ensure clean state
+        await driverAdapter.executeRaw({ sql: queries.drop, args: [] }).catch(() => {
+          // Ignore errors if table doesn't exist
+        });
         // Ensure table exists and has data
         await driverAdapter.executeRaw({ sql: queries.create, args: [] });
         await driverAdapter.executeRaw(queries.insert);
@@ -274,6 +290,10 @@ async function runAllTests(): Promise<AdapterRunSummary> {
     {
       name: "Transaction Test",
       test: async (driverAdapter: any, queries: any) => {
+        // Drop table first to ensure clean state
+        await driverAdapter.executeRaw({ sql: queries.drop, args: [] }).catch(() => {
+          // Ignore errors if table doesn't exist
+        });
         await driverAdapter.executeRaw({ sql: queries.create, args: [] });
         
         const tx = await driverAdapter.startTransaction();
@@ -298,16 +318,60 @@ async function runAllTests(): Promise<AdapterRunSummary> {
 
   const allResults: TestResult[] = [];
 
+  // Group adapters by connection string to avoid parallel execution conflicts
+  const adapterGroups = new Map<string, AdapterConfig[]>();
+  adapters.forEach(adapter => {
+    const key = adapter.connectionString;
+    if (!adapterGroups.has(key)) {
+      adapterGroups.set(key, []);
+    }
+    adapterGroups.get(key)!.push(adapter);
+  });
+
   for (const testSuite of testSuites) {
     console.log(`📋 Running ${testSuite.name}...`);
     
-    const results = await Promise.all(
-      adapters.map(adapterConfig =>
-        runTest(adapterConfig, testSuite.name, (driverAdapter) =>
-          testSuite.test(driverAdapter, adapterConfig.testQueries)
-        )
-      )
-    );
+    const results: TestResult[] = [];
+    
+    // Process adapter groups: run different connection strings in parallel,
+    // but serialize adapters that share the same connection string
+    const groupPromises = Array.from(adapterGroups.entries()).map(async ([connectionString, groupAdapters]) => {
+      const groupResults: [AdapterConfig, TestResult][] = [];
+      
+      if (groupAdapters.length === 1) {
+        // Single adapter for this connection - just run it
+        const result = await runTest(
+          groupAdapters[0],
+          testSuite.name,
+          (driverAdapter) => testSuite.test(driverAdapter, groupAdapters[0].testQueries)
+        );
+        groupResults.push([groupAdapters[0], result]);
+      } else {
+        // Multiple adapters share the same connection - run sequentially
+        for (const adapterConfig of groupAdapters) {
+          const result = await runTest(
+            adapterConfig,
+            testSuite.name,
+            (driverAdapter) => testSuite.test(driverAdapter, adapterConfig.testQueries)
+          );
+          groupResults.push([adapterConfig, result]);
+        }
+      }
+      
+      return groupResults;
+    });
+    
+    // Wait for all groups to complete (parallel across groups, sequential within groups)
+    const groupResults = await Promise.all(groupPromises);
+    
+    // Flatten results and maintain original adapter order
+    const resultMap = new Map<string, TestResult>();
+    groupResults.flat().forEach(([adapter, result]) => {
+      resultMap.set(adapter.name, result);
+    });
+    
+    // Get results in original adapter order
+    results.push(...adapters.map(adapter => resultMap.get(adapter.name)!));
     
     allResults.push(...results);
     
