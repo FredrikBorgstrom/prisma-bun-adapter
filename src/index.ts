@@ -636,6 +636,8 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
       let hasArray = false;
       let hasOtherObjects = false;
       let arrayElementType: ColumnType | null = null;
+      let hasNonArrayValue = false;
+      const primitiveTypes = new Set<string>();
 
       for (let r = 0; r < result.length; r++) {
         const v = result[r][name];
@@ -646,14 +648,30 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
           if (v.length > 0 && arrayElementType === null) {
             arrayElementType = this.inferColumnTypeFast(v[0]);
           }
-          break;
+          continue;
         } else if (
           typeof v === "object" &&
           !(v instanceof Date) &&
           !Buffer.isBuffer(v)
         ) {
           hasOtherObjects = true;
+          hasNonArrayValue = true;
+          continue;
         }
+
+        hasNonArrayValue = true;
+        primitiveTypes.add(typeof v);
+      }
+
+      const hasMixedPrimitiveTypes = primitiveTypes.size > 1;
+
+      if (
+        hasOtherObjects ||
+        hasMixedPrimitiveTypes ||
+        (hasArray && hasNonArrayValue)
+      ) {
+        types[i] = ColumnTypeEnum.Json;
+        continue;
       }
 
       if (hasArray && arrayElementType !== null) {
@@ -704,8 +722,19 @@ abstract class BaseBunDriverAdapter implements SqlDriverAdapter {
     if (value === null || value === undefined) return "null";
     const t = typeof value;
     if (t === "string") {
-      const s = value as string;
-      return this.isJsonishString(s) ? s : JSON.stringify(s);
+      let s = (value as string).trim();
+
+      if (this.isJsonishString(s)) {
+        try {
+          JSON.parse(s);
+          return s;
+        } catch {
+          const unwrapped = s.replace(/^"+|"+$/g, "");
+          return JSON.stringify(unwrapped);
+        }
+      }
+
+      return JSON.stringify(s);
     }
     if (t === "number" || t === "boolean") return JSON.stringify(value);
     if (value instanceof Date) return JSON.stringify(value.toISOString());

@@ -478,6 +478,10 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       }
 
       return { columnNames, columnTypes, rows };
+
+    } catch (error) {
+      console.error("Error in queryRaw:", error);
+      throw new Error(error instanceof Error ? error.message : String(error));
     } finally {
       this.releaseConnection(connection);
     }
@@ -1104,6 +1108,8 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       let hasArray = false;
       let hasOtherObjects = false;
       let arrayElementType: ColumnType | null = null;
+      let hasNonArrayValue = false;
+      const primitiveTypes = new Set<string>();
 
       for (let r = 0; r < result.length; r++) {
         const v = result[r][name];
@@ -1114,14 +1120,30 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
           if (v.length > 0 && arrayElementType === null) {
             arrayElementType = this.inferColumnTypeFast(v[0]);
           }
-          break;
+          continue;
         } else if (
           typeof v === "object" &&
           !(v instanceof Date) &&
           !Buffer.isBuffer(v)
         ) {
           hasOtherObjects = true;
+          hasNonArrayValue = true;
+          continue;
         }
+
+        hasNonArrayValue = true;
+        primitiveTypes.add(typeof v);
+      }
+
+      const hasMixedPrimitiveTypes = primitiveTypes.size > 1;
+
+      if (
+        hasOtherObjects ||
+        hasMixedPrimitiveTypes ||
+        (hasArray && hasNonArrayValue)
+      ) {
+        types[i] = ColumnTypeEnum.Json;
+        continue;
       }
 
       if (hasArray && arrayElementType !== null) {
@@ -1172,8 +1194,25 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     if (value === null || value === undefined) return "null";
     const t = typeof value;
     if (t === "string") {
-      const s = value as string;
-      return this.isJsonishString(s) ? s : JSON.stringify(s);
+      // Handle strings that may already contain JSON or be improperly wrapped
+      let s = (value as string).trim();
+
+      // Fast path: valid JSON as-is
+      if (this.isJsonishString(s)) {
+        try {
+          // Validate it parses; if it does, return unchanged
+          JSON.parse(s);
+          return s;
+        } catch {
+          // If it looks JSON-ish but is malformed (e.g., ""value""),
+          // try to normalize by stripping repeated leading/trailing quotes
+          const unwrapped = s.replace(/^"+|"+$/g, "");
+          return JSON.stringify(unwrapped);
+        }
+      }
+
+      // Not JSON-like: treat as a plain string value
+      return JSON.stringify(s);
     }
     if (t === "number" || t === "boolean") return JSON.stringify(value);
     if (value instanceof Date) return JSON.stringify(value.toISOString());

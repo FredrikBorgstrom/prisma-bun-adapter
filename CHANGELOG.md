@@ -1,6 +1,14 @@
 Changelog
 =========
-1.1.9 2025-10-31
+1.1.10 - 2025-11-01
+-------------------
+
+- Improved column type inference: Enhanced detection of mixed types (arrays with non-array values, mixed primitive types). Columns with mixed types are now correctly classified as JSON, preventing type coercion errors.
+- Enhanced JSON string handling: Added validation of JSON strings using JSON.parse before returning. Improved handling of malformed JSON strings (e.g., double-quoted strings like `""value""`) by unwrapping improperly wrapped quotes.
+- Error handling: Added comprehensive error handling in optimized adapter's queryRaw method with proper error propagation.
+
+1.1.9 - 2025-10-31
+-------------------
 Forgot to build to dist
 
 1.1.8 - 2025-10-31
