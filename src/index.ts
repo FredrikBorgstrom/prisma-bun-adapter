@@ -1215,5 +1215,9 @@ export default BunPostgresAdapter;
 // Re-export optimized Postgres for convenience so consumers can opt-in
 // without changing import path structure if they prefer a named export.
 export {
-  BunPostgresAdapter as BunPostgresOptimized, BunPostgresAdapter as OptimizedBunPostgresAdapter, OptimizedBunPostgresDriverAdapter
+  BunPostgresAdapter as BunPostgresOptimized,
+  BunPostgresAdapter as OptimizedBunPostgresAdapter,
+  OptimizedBunPostgresDriverAdapter,
+  type BunPostgresConfig as OptimizedBunPostgresConfig,
+  type PoolStats
 } from "./optimized-index.js";

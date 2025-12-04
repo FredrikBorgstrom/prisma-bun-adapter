@@ -82,6 +82,91 @@ The adapter looks at a few environment variables to control pooling behaviour:
 
 > Build selection (base vs optimised) is done by import path, not by an environment variable. If you want to gate which build you load at runtime, do so in your host application code (e.g. `if (process.env.MY_FLAG) require("@abcx3/prisma-bun-adapter/optimized") else require("@abcx3/prisma-bun-adapter")`).
 
+Connection Health & Pool Management
+-----------------------------------
+
+The optimized adapter includes robust connection health checking to handle intermittent connection issues caused by:
+- PostgreSQL server idle timeouts (`idle_session_timeout`, `tcp_keepalives_*`)
+- Network firewalls dropping idle TCP connections
+- Database restarts
+
+### Configuration Options
+
+```ts
+import { BunPostgresAdapter } from "@abcx3/prisma-bun-adapter/optimized";
+
+const adapter = new BunPostgresAdapter({
+  connectionString: process.env.DATABASE_URL!,
+  maxConnections: 20,
+  
+  // Connection validation settings (all optional)
+  validateOnBorrow: true,           // Enable health checks (default: true)
+  validateIdleThresholdMs: 10000,   // Only validate connections idle > 10s (default: 10000)
+  validationQuery: "SELECT 1",      // Health check query (default: "SELECT 1")
+  maxAcquireRetries: 2,             // Retry acquiring healthy connections (default: 2)
+});
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `validateOnBorrow` | `true` | When enabled, validates connections before returning them from the pool |
+| `validateIdleThresholdMs` | `10000` | Only validate connections that have been idle longer than this (ms). Avoids validation overhead for recently-used connections |
+| `validationQuery` | `"SELECT 1"` | Lightweight query used to test connection liveness |
+| `maxAcquireRetries` | `2` | Number of times to retry acquiring a healthy connection before failing |
+
+### How It Works
+
+1. **Smart Validation**: Connections are only validated if they've been idle longer than `validateIdleThresholdMs`. Recently-used connections skip validation for better performance.
+
+2. **Automatic Eviction**: Dead connections are automatically detected and removed from the pool. The adapter tracks metadata for each connection including creation time, last use time, and last validation time.
+
+3. **Error-Based Eviction**: If a query fails with a connection-related error (e.g., "connection reset", "socket hang up", authentication errors from stale connections), that connection is evicted instead of being returned to the pool.
+
+4. **Retry Logic**: When acquiring a connection, the adapter will retry up to `maxAcquireRetries` times if dead connections are encountered.
+
+### Pool Statistics
+
+You can monitor pool health using the `getPoolStats()` method on the driver adapter:
+
+```ts
+import { PrismaClient } from "@prisma/client";
+import { BunPostgresAdapter, OptimizedBunPostgresDriverAdapter } from "@abcx3/prisma-bun-adapter/optimized";
+
+const adapter = new BunPostgresAdapter({
+  connectionString: process.env.DATABASE_URL!,
+});
+
+const driver = await adapter.connect() as OptimizedBunPostgresDriverAdapter;
+const prisma = new PrismaClient({ adapter: driver });
+
+// Get pool statistics
+const stats = driver.getPoolStats();
+console.log(stats);
+// {
+//   total: 5,                    // Total connections in pool
+//   idle: 3,                     // Available connections
+//   active: 2,                   // Connections in use
+//   waiting: 0,                  // Requests waiting for a connection
+//   deadConnectionsEvicted: 1,   // Dead connections removed
+//   validationFailures: 1,       // Failed health checks
+// }
+```
+
+### Recommended Settings
+
+For most production workloads:
+
+```ts
+const adapter = new BunPostgresAdapter({
+  connectionString: process.env.DATABASE_URL!,
+  maxConnections: 10,              // Adjust based on your workload
+  validateOnBorrow: true,          // Enable health checks
+  validateIdleThresholdMs: 10000,  // 10 seconds - shorter than server timeout
+});
+```
+
+If your PostgreSQL server has a short `idle_session_timeout` (e.g., 30 seconds), set `validateIdleThresholdMs` to be shorter (e.g., 5000ms) to catch stale connections before they cause errors.
+
 > **Heads up:** Bun’s pooled connections can currently misbehave inside nested Prisma transactions (connections are reused too early, leading to “Transaction already closed” errors). Until that bug is fully resolved, the optimised adapter defaults `PRISMA_BUN_ADAPTER_DISABLE_POOL_FOR_TX` to `true`; leave it in place unless you have a local fix, or use the base adapter if preferred.
 
 

@@ -13,6 +13,29 @@ export interface BunPostgresConfig {
   connectionString: string;
   maxConnections?: number;
   idleTimeout?: number;
+  /**
+   * Validate connections before returning them from the pool.
+   * When true, runs a lightweight health check (SELECT 1) on connections
+   * that have been idle longer than `validateIdleThresholdMs`.
+   * Defaults to true.
+   */
+  validateOnBorrow?: boolean;
+  /**
+   * Only validate connections that have been idle for at least this many milliseconds.
+   * This avoids unnecessary validation overhead for recently-used connections.
+   * Defaults to 10000 (10 seconds).
+   */
+  validateIdleThresholdMs?: number;
+  /**
+   * Custom query to use for connection validation.
+   * Defaults to 'SELECT 1'.
+   */
+  validationQuery?: string;
+  /**
+   * Maximum number of retries when acquiring a healthy connection from the pool.
+   * Defaults to 2.
+   */
+  maxAcquireRetries?: number;
   ssl?:
   | boolean
   | {
@@ -21,6 +44,24 @@ export interface BunPostgresConfig {
     cert?: string;
     key?: string;
   };
+}
+
+/**
+ * Pool statistics for debugging and monitoring
+ */
+export interface PoolStats {
+  /** Total connections in the pool */
+  total: number;
+  /** Idle connections available for use */
+  idle: number;
+  /** Connections currently in use */
+  active: number;
+  /** Requests waiting for a connection */
+  waiting: number;
+  /** Total dead connections evicted since adapter creation */
+  deadConnectionsEvicted: number;
+  /** Total connection validation failures */
+  validationFailures: number;
 }
 
 interface BunSqlResult extends Array<any> {
@@ -59,6 +100,18 @@ const DATETIME_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Metadata tracked for each pooled connection
+ */
+interface ConnectionMetadata {
+  /** Timestamp when this connection was created */
+  createdAt: number;
+  /** Timestamp when this connection was last used (released back to pool) */
+  lastUsedAt: number;
+  /** Timestamp when this connection was last validated */
+  lastValidatedAt: number;
+}
+
 export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
   readonly provider = "postgres" as const;
   readonly adapterName = "bun-postgres-adapter-optimized";
@@ -82,13 +135,29 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
   private minPoolSize: number;
   // Track pending connection creation to avoid duplicate creates
   private pendingConnections: number = 0;
+  // Connection health tracking
+  private connectionMetadata: Map<BunSqlConnection, ConnectionMetadata> = new Map();
+  // Pool health statistics
+  private deadConnectionsEvicted: number = 0;
+  private validationFailures: number = 0;
+  // Configuration for connection validation
+  private validateOnBorrow: boolean;
+  private validateIdleThresholdMs: number;
+  private validationQuery: string;
+  private maxAcquireRetries: number;
 
-  constructor(connectionString: string, maxConnections: number = 20) {
+  constructor(connectionString: string, maxConnections: number = 20, config?: Partial<BunPostgresConfig>) {
     this.connectionString = connectionString;
     this.poolingDisabled = (process.env.PRISMA_BUN_ADAPTER_DISABLE_POOL || "false") === "true";
     this.disablePoolForTransactions =
       (process.env.PRISMA_BUN_ADAPTER_DISABLE_POOL_FOR_TX || "true") === "true" || this.poolingDisabled;
     this.maxConnections = this.poolingDisabled ? 1 : maxConnections;
+
+    // Connection validation configuration
+    this.validateOnBorrow = config?.validateOnBorrow ?? true;
+    this.validateIdleThresholdMs = config?.validateIdleThresholdMs ?? 10000; // 10 seconds default
+    this.validationQuery = config?.validationQuery ?? "SELECT 1";
+    this.maxAcquireRetries = config?.maxAcquireRetries ?? 2;
 
     if (this.poolingDisabled) {
       this.preWarmThreshold = 0;
@@ -102,12 +171,183 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     }
   }
 
+  /**
+   * Get current pool statistics for monitoring and debugging
+   */
+  getPoolStats(): PoolStats {
+    return {
+      total: this.connections.length,
+      idle: this.availableConnections.length,
+      active: this.inUseConnections.size,
+      waiting: this.waitQueue.length,
+      deadConnectionsEvicted: this.deadConnectionsEvicted,
+      validationFailures: this.validationFailures,
+    };
+  }
+
+  /**
+   * Check if a connection is still alive by running a lightweight query
+   */
+  private async isConnectionAlive(connection: BunSqlConnection): Promise<boolean> {
+    try {
+      const strings = this.createTemplateStrings([this.validationQuery]);
+      await connection(strings);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Determine if a connection needs validation based on idle time
+   */
+  private needsValidation(connection: BunSqlConnection): boolean {
+    if (!this.validateOnBorrow) {
+      return false;
+    }
+    const metadata = this.connectionMetadata.get(connection);
+    if (!metadata) {
+      // Unknown connection, validate to be safe
+      return true;
+    }
+    const idleTime = Date.now() - metadata.lastUsedAt;
+    return idleTime >= this.validateIdleThresholdMs;
+  }
+
+  /**
+   * Check if an error indicates a dead/broken connection
+   */
+  private isConnectionError(error: unknown): boolean {
+    if (!error) return false;
+    
+    const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+    const errorCode = (error as any)?.code?.toString?.() ?? (error as any)?.errno ?? "";
+    
+    // Check error message patterns
+    const connectionErrorPatterns = [
+      "password authentication failed",
+      "connection refused",
+      "connection reset",
+      "connection terminated",
+      "connection closed",
+      "socket hang up",
+      "econnreset",
+      "econnrefused",
+      "epipe",
+      "etimedout",
+      "enetunreach",
+      "ehostunreach",
+      "network is unreachable",
+      "no route to host",
+      "broken pipe",
+      "server closed the connection",
+      "unexpected end of data",
+      "ssl connection has been closed",
+      "the connection was lost",
+      "cannot acquire connection",
+      "too many clients",
+    ];
+    
+    for (const pattern of connectionErrorPatterns) {
+      if (message.includes(pattern)) {
+        return true;
+      }
+    }
+    
+    // Check PostgreSQL error codes indicating connection issues
+    const connectionErrorCodes = [
+      "08000", // connection_exception
+      "08003", // connection_does_not_exist
+      "08006", // connection_failure
+      "08001", // sqlclient_unable_to_establish_sqlconnection
+      "08004", // sqlserver_rejected_establishment_of_sqlconnection
+      "08007", // transaction_resolution_unknown
+      "08P01", // protocol_violation
+      "57P01", // admin_shutdown
+      "57P02", // crash_shutdown
+      "57P03", // cannot_connect_now
+      "28P01", // invalid_password (often indicates stale connection)
+      "28000", // invalid_authorization_specification
+    ];
+    
+    if (connectionErrorCodes.includes(errorCode)) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  /**
+   * Remove a dead connection from the pool
+   */
+  private evictConnection(connection: BunSqlConnection): void {
+    // Remove from all tracking structures
+    const idx = this.connections.indexOf(connection);
+    if (idx !== -1) {
+      this.connections.splice(idx, 1);
+    }
+    
+    const availIdx = this.availableConnections.indexOf(connection);
+    if (availIdx !== -1) {
+      this.availableConnections.splice(availIdx, 1);
+    }
+    
+    this.inUseConnections.delete(connection);
+    this.connectionMetadata.delete(connection);
+    this.deadConnectionsEvicted++;
+    
+    // Try to close the connection gracefully (fire-and-forget)
+    this.closeConnection(connection);
+  }
+
   private async getConnection(): Promise<BunSqlConnection> {
     if (this.poolingDisabled) {
       const connection = await this.createConnection();
       this.inUseConnections.add(connection);
       return connection;
     }
+    
+    // Try to acquire a healthy connection with retries
+    for (let attempt = 0; attempt <= this.maxAcquireRetries; attempt++) {
+      const connection = await this.acquireConnectionFromPool();
+      
+      // Check if connection needs validation
+      if (this.needsValidation(connection)) {
+        const isAlive = await this.isConnectionAlive(connection);
+        
+        if (!isAlive) {
+          // Connection is dead, evict it and try again
+          this.validationFailures++;
+          console.warn(
+            `[prisma-bun-adapter] Dead connection detected and evicted from pool ` +
+            `(attempt ${attempt + 1}/${this.maxAcquireRetries + 1})`
+          );
+          this.evictConnection(connection);
+          continue;
+        }
+        
+        // Update validation timestamp
+        const metadata = this.connectionMetadata.get(connection);
+        if (metadata) {
+          metadata.lastValidatedAt = Date.now();
+        }
+      }
+      
+      return connection;
+    }
+    
+    // All retries exhausted, throw an error
+    throw new Error(
+      `[prisma-bun-adapter] Failed to acquire a healthy database connection ` +
+      `after ${this.maxAcquireRetries + 1} attempts. ` +
+      `Pool stats: ${JSON.stringify(this.getPoolStats())}`
+    );
+  }
+
+  /**
+   * Acquire a connection from the pool without validation
+   */
+  private async acquireConnectionFromPool(): Promise<BunSqlConnection> {
     // Fast path: try to get an available connection (LIFO is faster than round-robin)
     if (this.availableConnections.length > 0) {
       const connection = this.availableConnections.pop()!;
@@ -129,7 +369,7 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     }
 
     // If we haven't reached the max, create a new connection
-    if (this.connections.length < this.maxConnections) {
+    if (this.connections.length + this.pendingConnections < this.maxConnections) {
       this.pendingConnections++;
       try {
         const connection = await this.createConnection();
@@ -196,6 +436,12 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       return;
     }
     
+    // Update last used timestamp for idle-time validation
+    const metadata = this.connectionMetadata.get(connection);
+    if (metadata) {
+      metadata.lastUsedAt = Date.now();
+    }
+    
     // Check if anyone is waiting - prioritize waiters
     if (this.waitQueue.length > 0) {
       const waiter = this.waitQueue.shift();
@@ -222,6 +468,21 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       this.preWarmConnection().catch(() => {
         // Ignore
       });
+    }
+  }
+
+  /**
+   * Release a connection that encountered an error.
+   * If the error indicates a broken connection, evict it from the pool.
+   */
+  private releaseConnectionWithError(connection: BunSqlConnection, error: unknown): void {
+    if (this.isConnectionError(error)) {
+      console.warn(
+        `[prisma-bun-adapter] Evicting connection due to error: ${error instanceof Error ? error.message : String(error)}`
+      );
+      this.evictConnection(connection);
+    } else {
+      this.releaseConnection(connection);
     }
   }
 
@@ -266,6 +527,15 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
             const setPath = this.createTemplateStrings([`SET search_path TO "${schemaForSearchPath}"`]);
             await conn(setPath);
           }
+          
+          // Track connection metadata for health checking
+          const now = Date.now();
+          this.connectionMetadata.set(conn, {
+            createdAt: now,
+            lastUsedAt: now,
+            lastValidatedAt: now,
+          });
+          
           return conn;
         } catch (warmErr: any) {
           if (this.isPgAuthFailed(warmErr)) {
@@ -453,10 +723,11 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
 
   async dispose(): Promise<void> {
     // Close all connections in parallel
-    await Promise.all(this.connections.map((conn) => conn.end()));
+    await Promise.all(this.connections.map((conn) => conn.end().catch(() => {})));
     this.connections = [];
     this.availableConnections = [];
     this.inUseConnections.clear();
+    this.connectionMetadata.clear();
     this.roundRobinIndex = 0;
     if (this.waitQueue.length > 0) {
       const error = new Error("Adapter disposed");
@@ -468,6 +739,7 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
 
   async executeScript(script: string): Promise<void> {
     const connection = await this.getConnection();
+    let scriptError: unknown = null;
     try {
       const statements = script.split(";").filter((stmt) => stmt.trim());
       for (const statement of statements) {
@@ -477,13 +749,22 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
           this.ensureSuccessfulResult(result, statement.trim());
         }
       }
+    } catch (error) {
+      scriptError = error;
+      throw error;
     } finally {
-      this.releaseConnection(connection);
+      // Evict connection if it appears to be dead, otherwise return to pool
+      if (scriptError) {
+        this.releaseConnectionWithError(connection, scriptError);
+      } else {
+        this.releaseConnection(connection);
+      }
     }
   }
 
   async queryRaw(query: SqlQuery): Promise<SqlResultSet> {
     const connection = await this.getConnection();
+    let queryError: unknown = null;
     try {
       const result = await this.executeQueryOptimized(
         connection,
@@ -524,15 +805,23 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       return { columnNames, columnTypes, rows };
 
     } catch (error) {
+      queryError = error;
       console.error("Error in queryRaw:", error);
-      this.throwDriverError(error, query.sql, { query, stage: "queryRaw" });
+      // throwDriverError always throws, but TypeScript needs explicit throw
+      throw this.createDriverError(error, query.sql, { query, stage: "queryRaw" });
     } finally {
-      this.releaseConnection(connection);
+      // Evict connection if it appears to be dead, otherwise return to pool
+      if (queryError) {
+        this.releaseConnectionWithError(connection, queryError);
+      } else {
+        this.releaseConnection(connection);
+      }
     }
   }
 
   async executeRaw(query: SqlQuery): Promise<number> {
     const connection = await this.getConnection();
+    let queryError: unknown = null;
     try {
       const result = await this.executeQueryOptimized(
         connection,
@@ -541,9 +830,16 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       );
       return result.affectedRows || result.count || 0;
     } catch (error) {
-      this.throwDriverError(error, query.sql, { query, stage: "executeRaw" });
+      queryError = error;
+      // createDriverError returns the error for explicit throw (TypeScript satisfaction)
+      throw this.createDriverError(error, query.sql, { query, stage: "executeRaw" });
     } finally {
-      this.releaseConnection(connection);
+      // Evict connection if it appears to be dead, otherwise return to pool
+      if (queryError) {
+        this.releaseConnectionWithError(connection, queryError);
+      } else {
+        this.releaseConnection(connection);
+      }
     }
   }
 
@@ -1086,21 +1382,24 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
     return this.ensureSuccessfulResult(result, sql);
   }
 
-  private throwDriverError(rawError: unknown, sql: string, payload?: unknown): never {
+  /**
+   * Create a DriverAdapterError from a raw error (returns instead of throwing for TypeScript control flow)
+   */
+  private createDriverError(rawError: unknown, sql: string, payload?: unknown): DriverAdapterError {
     if (rawError instanceof DriverAdapterError) {
-      throw rawError;
+      return rawError;
     }
 
     if (rawError instanceof Error) {
       const mapped = this.mapPostgresError(rawError);
       (mapped as any).context = { sql, payload, original: rawError };
-      throw new DriverAdapterError(mapped);
+      return new DriverAdapterError(mapped);
     }
 
     if (rawError && typeof rawError === "object") {
       const mapped = this.mapPostgresError(rawError);
       (mapped as any).context = { sql, payload, original: rawError };
-      throw new DriverAdapterError(mapped);
+      return new DriverAdapterError(mapped);
     }
 
     const message =
@@ -1116,7 +1415,11 @@ export class OptimizedBunPostgresDriverAdapter implements SqlDriverAdapter {
       originalMessage: message,
     };
     mapped.context = { sql, payload, original: rawError };
-    throw new DriverAdapterError(mapped);
+    return new DriverAdapterError(mapped);
+  }
+
+  private throwDriverError(rawError: unknown, sql: string, payload?: unknown): never {
+    throw this.createDriverError(rawError, sql, payload);
   }
 
   private mapPostgresError(error: any) {
@@ -1514,9 +1817,13 @@ export class BunPostgresAdapter {
         ? 20 // Default for string config
         : this.config.maxConnections || 20;
 
+    // Pass the full config object for connection validation settings
+    const configOptions = typeof this.config === "string" ? undefined : this.config;
+
     return new OptimizedBunPostgresDriverAdapter(
       connectionString,
       maxConnections,
+      configOptions,
     );
   }
 

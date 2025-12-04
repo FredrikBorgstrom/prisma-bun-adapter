@@ -1,5 +1,45 @@
 Changelog
 =========
+1.2.0 - 2025-12-04
+-------------------
+
+**Major Feature: Connection Health Checking & Pool Management**
+
+Added robust connection health checking to the optimized PostgreSQL adapter to fix intermittent "password authentication failed" errors caused by stale/dead connections in the pool.
+
+**New Configuration Options:**
+- `validateOnBorrow` (default: `true`) - Enable/disable connection health checks before returning connections from the pool
+- `validateIdleThresholdMs` (default: `10000`) - Only validate connections that have been idle longer than this threshold (avoids overhead for recently-used connections)
+- `validationQuery` (default: `"SELECT 1"`) - Custom query used for connection validation
+- `maxAcquireRetries` (default: `2`) - Number of retries when acquiring a healthy connection
+
+**New Features:**
+- **Smart Connection Validation**: Connections are only validated if they've been idle longer than `validateIdleThresholdMs`, avoiding unnecessary overhead
+- **Automatic Dead Connection Eviction**: Dead connections are automatically detected and removed from the pool
+- **Error-Based Eviction**: When queries fail with connection-related errors (e.g., "connection reset", "socket hang up", PostgreSQL error codes), the connection is evicted instead of being returned to the pool
+- **Connection Metadata Tracking**: Each connection tracks creation time, last use time, and last validation time for intelligent health checking
+- **Retry Logic**: Automatic retry when acquiring connections encounters dead connections
+- **Pool Statistics API**: New `getPoolStats()` method returns detailed pool health metrics including total connections, idle/active counts, waiting requests, and eviction statistics
+
+**Error Detection:**
+- Detects connection errors via message patterns (e.g., "connection reset", "socket hang up", "password authentication failed")
+- Detects PostgreSQL error codes indicating connection issues (e.g., `08003`, `08006`, `57P01`, `28P01`, `28000`)
+- Comprehensive error code coverage for connection failures, shutdowns, and authentication issues
+
+**Breaking Changes:**
+- None - all new features are opt-in via configuration and default to safe values
+
+**Documentation:**
+- Updated README with comprehensive connection health checking documentation
+- Added configuration examples and recommended settings
+- Added pool statistics usage examples
+
+**Fixes:**
+- Resolves intermittent "password authentication failed" errors from stale connections
+- Prevents reuse of connections closed by PostgreSQL server (idle timeouts, keepalive settings)
+- Prevents reuse of connections dropped by network firewalls
+- Handles database restarts gracefully by evicting dead connections
+
 1.1.11 - 2025-11-02
 -------------------
 

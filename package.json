@@ -1,6 +1,6 @@
 {
   "name": "@abcx3/prisma-bun-adapter",
-  "version": "1.1.11",
+  "version": "1.2.0",
   "description": "Prisma adapters for Bun's native SQL clients (PostgreSQL, MySQL, SQLite)",
   "type": "module",
   "main": "dist/index.js",
@@ -28,6 +28,8 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:clean": "rm -rf dist && tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
     "dev": "bun --watch src/index.ts",
     "test": "bun test",
     "debug:example": "bun --watch example/usage.ts",
