@@ -1,6 +1,9 @@
 Changelog
 =========
 
+1.3.1 - 2025-12-09
+Set peer depency to ^7.0.0
+
 1.3.0 - 2025-12-09
 -------------------
 Upgraded to Prisma 7.0
