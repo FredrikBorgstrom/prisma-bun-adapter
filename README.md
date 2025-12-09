@@ -1,6 +1,8 @@
 Prisma Bun Adapter
 ==================
 
+**Using Prisma 7.0 as of version 1.3**
+
 Prisma driver adapters for Bun's native SQL clients (PostgreSQL, MySQL, SQLite).
 
 - Zero external runtime dependencies for Bun-backed connections
